@@ -137,6 +137,9 @@ class WorkflowEngine:
         self.data_dir = Path(self.plugin_dir) / "data"
         self.data_dir.mkdir(exist_ok=True)
         
+        # 用户 workflow 目录（在 auto_save_dir 下，更新插件不会丢失）
+        self.user_workflow_dir: Optional[Path] = None
+        
         # ---- 服务器 ----
         self.comfyui_servers = self._parse_comfyui_servers(config.get("comfyui_url", []))
         self.temp_servers: List['WorkflowEngine.ServerState'] = []
@@ -201,6 +204,10 @@ class WorkflowEngine:
         else:
             self.auto_save_dir = str(self.data_dir / auto_save_config)
         self._ensure_directory_exists(self.auto_save_dir, "auto_save_dir")
+        
+        # 用户 workflow 目录：在 auto_save_dir 下，更新插件不会丢失
+        self.user_workflow_dir = Path(self.auto_save_dir) / "workflows"
+        self.user_workflow_dir.mkdir(parents=True, exist_ok=True)
         
         # ---- 下载/输出 ----
         self.enable_output_zip = config.get("enable_output_zip", True)
@@ -479,38 +486,41 @@ class WorkflowEngine:
     def _load_workflows(self):
         """同步加载 workflow 模块（__init__ 中调用，确保前缀立即可用）"""
         try:
-            if not self.workflow_dir.exists():
-                self.workflow_dir.mkdir(parents=True, exist_ok=True)
-                return
-
-            for wfn in [f.name for f in self.workflow_dir.iterdir()]:
-                wf_path = self.workflow_dir / wfn
-                if not wf_path.is_dir():
-                    continue
-                config_file = wf_path / "config.json"
-                workflow_file = wf_path / "workflow.json"
-                if not config_file.exists() or not workflow_file.exists():
-                    continue
-                try:
-                    with open(config_file, 'r', encoding='utf-8') as f:
-                        config = json.load(f)
-                    with open(workflow_file, 'r', encoding='utf-8') as f:
-                        wf_data = json.load(f)
-                    required = ["name", "prefix", "input_nodes", "output_nodes"]
-                    if not all(f in config for f in required):
-                        continue
-                    prefix = config["prefix"]
-                    if prefix in self.workflow_prefixes:
-                        continue
-                    self._inject_main_config(config, wfn)
-                    self.workflows[wfn] = {"config": config, "workflow": wf_data, "path": wf_path}
-                    self.workflow_prefixes[prefix] = wfn
-                    logger.info(f"已加载workflow: {config['name']} (前缀: {prefix})")
-                except Exception as e:
-                    logger.error(f"加载workflow {wfn} 失败: {e}")
+            self._load_workflows_from_dir(self.user_workflow_dir, "用户")
+            self._load_workflows_from_dir(self.workflow_dir, "内置")
             logger.info(f"共加载 {len(self.workflows)} 个workflow模块")
         except Exception as e:
             logger.error(f"加载workflow模块失败: {e}")
+
+    def _load_workflows_from_dir(self, scan_dir: Path, source_label: str):
+        """从指定目录加载 workflow"""
+        if not scan_dir or not scan_dir.exists():
+            return
+        for wfn in [f.name for f in scan_dir.iterdir()]:
+            wf_path = scan_dir / wfn
+            if not wf_path.is_dir():
+                continue
+            config_file = wf_path / "config.json"
+            workflow_file = wf_path / "workflow.json"
+            if not config_file.exists() or not workflow_file.exists():
+                continue
+            try:
+                with open(config_file, 'r', encoding='utf-8') as f:
+                    config = json.load(f)
+                with open(workflow_file, 'r', encoding='utf-8') as f:
+                    wf_data = json.load(f)
+                required = ["name", "prefix", "input_nodes", "output_nodes"]
+                if not all(f in config for f in required):
+                    continue
+                prefix = config["prefix"]
+                if prefix in self.workflow_prefixes:
+                    continue
+                self._inject_main_config(config, wfn)
+                self.workflows[wfn] = {"config": config, "workflow": wf_data, "path": wf_path}
+                self.workflow_prefixes[prefix] = wfn
+                logger.info(f"已加载workflow[{source_label}]: {config['name']} (前缀: {prefix})")
+            except Exception as e:
+                logger.error(f"加载workflow {wfn} 失败: {e}")
 
     def _inject_main_config(self, config: dict, workflow_name: str):
         """将主程序配置注入到 workflow 配置"""
