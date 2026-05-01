@@ -263,30 +263,6 @@
         "default": "123",
         "hint": "Web配置管理界面的登录密码"
     },
-    "enable_web_api": {
-        "description": "启用Web API接口",
-        "type": "bool",
-        "default": false,
-        "hint": "控制是否启用Web API接口用于网页生成图片，true=启用，false=禁用"
-    },
-    "web_api_port": {
-        "description": "Web API端口",
-        "type": "int",
-        "default": 7778,
-        "hint": "Web API接口的端口号（建议1024-65535之间，默认7778）"
-    },
-    "web_api_allow_register": {
-        "description": "允许Web API注册新用户",
-        "type": "bool",
-        "default": true,
-        "hint": "控制是否允许用户通过Web API注册新账户，true=允许，false=禁止"
-    },
-    "web_api_image_proxy": {
-        "description": "启用Web API图片代理",
-        "type": "bool",
-        "default": true,
-        "hint": "控制Web API是否通过代理提供图片访问，避免暴露127.0.0.1地址，true=启用代理，false=直接返回ComfyUI地址"
-    },
     "group_whitelist": {
         "description": "群聊白名单",
         "type": "list",
