@@ -157,6 +157,9 @@ class ModComfyUI(Star):
 
         # 激活 LLM 工具
         self.context.activate_llm_tool("comfyui_txt2img")
+        self.context.activate_llm_tool("comfyui_queue_status")
+        self.context.activate_llm_tool("comfyui_workflow_list")
+        self.context.activate_llm_tool("comfyui_workflow_run")
 
     def _init_gui(self, config: dict):
         """初始化 GUI 服务器"""
@@ -900,6 +903,161 @@ background:linear-gradient(135deg,#667eea,#764ba2);min-height:100vh}}
     def _truncate_prompt(self, prompt: str, max_len: int = 8) -> str:
         return prompt[:max_len] + "..." if len(prompt) > max_len else prompt
 
+    def _resolve_workflow(self, workflow_ref: str) -> Tuple[Optional[str], Optional[dict], Optional[str]]:
+        """按目录名、前缀或显示名称查找 workflow。"""
+        eng = self.engine
+        ref = (workflow_ref or "").strip()
+        if not ref:
+            return None, None, "workflow不能为空"
+        if ref in eng.workflows:
+            return ref, eng.workflows[ref], None
+        if ref in eng.workflow_prefixes:
+            wfn = eng.workflow_prefixes[ref]
+            return wfn, eng.workflows[wfn], None
+
+        lowered = ref.lower()
+        matched = []
+        for wfn, info in eng.workflows.items():
+            cfg = info.get("config", {})
+            names = [wfn, str(cfg.get("name", "")), str(cfg.get("prefix", ""))]
+            if any(lowered == n.lower() for n in names if n):
+                matched.append(wfn)
+        if len(matched) == 1:
+            wfn = matched[0]
+            return wfn, eng.workflows[wfn], None
+        if len(matched) > 1:
+            return None, None, f"workflow匹配到多个结果：{', '.join(matched)}"
+        return None, None, f"未找到workflow：{ref}"
+
+    def _workflow_param_docs(self, cfg: dict) -> List[dict]:
+        docs = []
+        for nid, node_cfg in cfg.get("node_configs", {}).items():
+            for pname, pinfo in node_cfg.items():
+                docs.append({
+                    "node": nid,
+                    "name": pname,
+                    "aliases": pinfo.get("aliases", []),
+                    "type": pinfo.get("type", "string"),
+                    "required": bool(pinfo.get("required", False)),
+                    "default": pinfo.get("default"),
+                    "description": pinfo.get("description", ""),
+                    "options": pinfo.get("options", []),
+                    "min": pinfo.get("min"),
+                    "max": pinfo.get("max"),
+                })
+        return docs
+
+    def _format_workflow_list_for_ai(self, workflow_ref: str = "") -> str:
+        eng = self.engine
+        if workflow_ref:
+            wfn, info, err = self._resolve_workflow(workflow_ref)
+            if err:
+                return err
+            items = [(wfn, info)]
+        else:
+            items = list(eng.workflows.items())
+        if not items:
+            return "暂无可用Workflow"
+
+        blocks = []
+        for wfn, info in items:
+            cfg = info.get("config", {})
+            lines = [
+                f"- id: {wfn}",
+                f"  name: {cfg.get('name', wfn)}",
+                f"  prefix: {cfg.get('prefix', wfn)}",
+                f"  description: {cfg.get('description', '暂无') or '暂无'}",
+                f"  needs_image: {'yes' if cfg.get('input_nodes') else 'no'}",
+            ]
+            params = self._workflow_param_docs(cfg)
+            if params:
+                lines.append("  parameters:")
+                for p in params:
+                    aliases = f" aliases={p['aliases']}" if p["aliases"] else ""
+                    default = f" default={p['default']}" if p["default"] is not None else ""
+                    required = "required" if p["required"] else "optional"
+                    limits = []
+                    if p["options"]:
+                        limits.append(f"options={p['options']}")
+                    if p["min"] is not None:
+                        limits.append(f"min={p['min']}")
+                    if p["max"] is not None:
+                        limits.append(f"max={p['max']}")
+                    limit_text = f" {' '.join(limits)}" if limits else ""
+                    desc = f" - {p['description']}" if p["description"] else ""
+                    lines.append(f"    - {p['name']} ({p['type']}, {required}){default}{aliases}{limit_text}{desc}")
+            else:
+                lines.append("  parameters: none")
+            blocks.append("\n".join(lines))
+        return "\n\n".join(blocks)
+
+    def _parse_workflow_param_text(self, workflow_text: str, cfg: dict) -> dict:
+        """解析聊天式 workflow 文本，支持裸提示词自动映射到“提示词”。"""
+        params_text = (workflow_text or "").strip()
+        node_configs = cfg.get("node_configs", {})
+        known_keys = set()
+        for _, nc in node_configs.items():
+            for pn, pi in nc.items():
+                known_keys.add(pn)
+                known_keys.update(pi.get("aliases", []))
+
+        args = []
+        if known_keys:
+            param_pat = '|'.join(re.escape(k) for k in known_keys)
+            regex = rf'(?<!\S)({param_pat})(?=\s*:)'
+            matches = list(re.finditer(regex, params_text))
+            prompt_parts = []
+            last_end = 0
+            for idx, m in enumerate(matches):
+                ps = m.start()
+                if ps > last_end:
+                    pp = params_text[last_end:ps].strip()
+                    if pp:
+                        prompt_parts.append(pp)
+                cp = params_text.find(':', ps)
+                if cp == -1:
+                    continue
+                nps = len(params_text)
+                if idx + 1 < len(matches):
+                    nps = matches[idx + 1].start()
+                val = params_text[cp + 1:nps].strip()
+                args.append(f"{m.group(1)}:{val}")
+                last_end = nps
+            if last_end < len(params_text):
+                pp = params_text[last_end:].strip()
+                if pp:
+                    prompt_parts.append(pp)
+            prompt_text = ' '.join(prompt_parts).strip()
+            if prompt_text:
+                args.insert(0, f"提示词:{prompt_text}")
+        elif params_text:
+            args.append(f"提示词:{params_text}")
+        return self.engine.parse_workflow_params(args, cfg)
+
+    def _parse_llm_workflow_parameters(self, parameters: Any, cfg: dict) -> dict:
+        """解析 LLM 工具参数，支持 JSON 对象或 参数:值 文本。"""
+        if isinstance(parameters, dict):
+            raw = parameters
+        else:
+            text = (parameters or "").strip()
+            raw = None
+            if text:
+                try:
+                    decoded = json.loads(text)
+                    if isinstance(decoded, dict):
+                        raw = decoded
+                except Exception:
+                    raw = None
+            if raw is None:
+                return self._parse_workflow_param_text(text, cfg)
+
+        args = []
+        for key, value in raw.items():
+            if value is None:
+                continue
+            args.append(f"{key}:{value}")
+        return self.engine.parse_workflow_params(args, cfg)
+
     # ========== 事件处理器 ==========
 
     # --- 文生图 ---
@@ -1129,43 +1287,7 @@ background:linear-gradient(135deg,#667eea,#764ba2);min-height:100vh}}
 
         # 参数解析
         params_text = full_text[len(prefix):].strip()
-        node_configs = cfg.get("node_configs", {})
-        known_keys = set()
-        for _, nc in node_configs.items():
-            for pn, pi in nc.items():
-                known_keys.add(pn)
-                known_keys.update(pi.get("aliases", []))
-        param_pat = '|'.join(re.escape(k) for k in known_keys)
-        regex = rf'(?<!\S)({param_pat})(?=\s*:)'
-        matches = list(re.finditer(regex, params_text))
-        args = []
-        prompt_parts = []
-        last_end = 0
-        for m in matches:
-            ps = m.start()
-            if ps > last_end:
-                pp = params_text[last_end:ps].strip()
-                if pp:
-                    prompt_parts.append(pp)
-            cp = params_text.find(':', ps)
-            if cp == -1:
-                continue
-            nps = len(params_text)
-            idx = matches.index(m)
-            if idx + 1 < len(matches):
-                nps = matches[idx + 1].start()
-            val = params_text[cp + 1:nps].strip()
-            args.append(f"{m.group(1)}:{val}")
-            last_end = nps
-        if last_end < len(params_text):
-            pp = params_text[last_end:].strip()
-            if pp:
-                prompt_parts.append(pp)
-        prompt_text = ' '.join(prompt_parts).strip()
-        if prompt_text:
-            args.insert(0, f"提示词:{prompt_text}")
-
-        params = eng.parse_workflow_params(args, cfg)
+        params = self._parse_workflow_param_text(params_text, cfg)
         missing = eng.validate_required_params(cfg, params)
         if missing:
             await self._send_with_auto_recall(event, event.plain_result(f"缺少必需参数：{'、'.join(missing)}"))
@@ -1699,6 +1821,118 @@ background:linear-gradient(135deg,#667eea,#764ba2);min-height:100vh}}
         servers = [s.name for s in eng.comfyui_servers if s.healthy]
         sf = f"\n可用服务器：{'、'.join(servers)}" if servers else "\n当前无可用服务器，任务将在服务器恢复后处理"
         return f"文生图任务已加入队列（排队：{eng.task_queue.qsize()}个）\n提示词：{prompt}\nSeed：{seed}\n分辨率：{w}x{h}{sf}"
+
+    @llm_tool(name="comfyui_queue_status")
+    async def comfyui_queue_status(self, event: AstrMessageEvent):
+        """Get current ComfyUI plugin queue and server status.
+        Args:
+        """
+        eng = self.engine
+        if not self._check_group_whitelist(event):
+            return "❌ 当前群聊不在白名单中！"
+
+        queued = eng.task_queue.qsize()
+        total_user_tasks = sum(eng.user_task_counts.values())
+        current_user_id = str(event.get_sender_id())
+        current_user_tasks = eng.user_task_counts.get(current_user_id, 0)
+        healthy_count = sum(1 for srv in eng.comfyui_servers if srv.healthy)
+        busy_count = sum(1 for srv in eng.comfyui_servers if srv.busy)
+
+        lines = [
+            "ComfyUI队列状态：",
+            f"- 当前排队任务：{queued}",
+            f"- 队列容量：{eng.max_task_queue}",
+            f"- 当前用户并发任务：{current_user_tasks}/{eng.max_concurrent_tasks_per_user}",
+            f"- 全部用户进行中任务：{total_user_tasks}",
+            f"- 活跃用户数：{len(eng.user_task_counts)}",
+            f"- 服务器：{healthy_count}/{len(eng.comfyui_servers)} 可用，{busy_count} 忙碌",
+            f"- 当前开放状态：{'开放' if eng._is_in_open_time() else '未开放'}",
+        ]
+
+        if eng.comfyui_servers:
+            lines.append("服务器详情：")
+            for srv in eng.comfyui_servers:
+                state = "可用" if srv.healthy else "不可用"
+                busy = "忙碌" if srv.busy else "空闲"
+                retry_after = ""
+                if srv.retry_after:
+                    retry_after = f"，重试时间：{srv.retry_after.strftime('%Y-%m-%d %H:%M:%S')}"
+                lines.append(
+                    f"- {srv.name}：{state}，{busy}，失败次数：{srv.failure_count}{retry_after}"
+                )
+        else:
+            lines.append("服务器详情：暂无配置")
+
+        return "\n".join(lines)
+
+    @llm_tool(name="comfyui_workflow_list")
+    async def comfyui_workflow_list(self, event: AstrMessageEvent, workflow: str = ""):
+        """Get available ComfyUI workflows and their parameters.
+        Args:
+            workflow(string): Optional workflow id, prefix, or name. Leave empty to list all workflows.
+        """
+        if not self._check_group_whitelist(event):
+            return "❌ 当前群聊不在白名单中！"
+        return self._format_workflow_list_for_ai(workflow)
+
+    @llm_tool(name="comfyui_workflow_run")
+    async def comfyui_workflow_run(self, event: AstrMessageEvent, workflow: str,
+                                   parameters: str = ""):
+        """Run a selected ComfyUI workflow with parameters.
+        Args:
+            workflow(string): Workflow id, prefix, or name from comfyui_workflow_list.
+            parameters(string): Prefer a JSON object string, e.g. "{\"提示词\":\"cat with blue eyes\", \"宽\":1024}". Text like "提示词:cat 宽:1024" is accepted only for compatibility. Use parameter names or aliases shown by comfyui_workflow_list.
+        """
+        eng = self.engine
+        if not self._check_group_whitelist(event):
+            return "❌ 当前群聊不在白名单中！"
+        if not eng._is_in_open_time():
+            return f"当前未开放～开放时间：{eng._get_open_time_desc()}"
+        if not eng._get_any_healthy_server():
+            return "当前没有可用的ComfyUI服务器。"
+
+        wfn, wf_info, err = self._resolve_workflow(workflow)
+        if err:
+            return err
+        cfg = wf_info["config"]
+        wf_data = wf_info["workflow"]
+
+        try:
+            params = self._parse_llm_workflow_parameters(parameters, cfg)
+        except Exception as e:
+            return f"参数解析失败：{self._filter_server_urls(str(e))}"
+
+        missing = eng.validate_required_params(cfg, params)
+        if missing:
+            return f"缺少必需参数：{'、'.join(missing)}\n可先调用 comfyui_workflow_list 查看参数。"
+        errs = eng.validate_param_values(cfg, params)
+        if errs:
+            return "参数错误：\n" + "\n".join(errs)
+
+        if cfg.get("input_nodes"):
+            return "此workflow需要图片输入，AI工具暂不支持执行需要图片输入的workflow。请使用聊天workflow命令并附图或引用图片消息。"
+
+        final_wf = eng.build_workflow(wf_data, cfg, params, [])
+        uid = str(event.get_sender_id())
+        if not await eng._increment_user_task_count(uid):
+            return f"您的并发任务数已达上限（{eng.max_concurrent_tasks_per_user}个）"
+        if eng.task_queue.full():
+            await eng._decrement_user_task_count(uid)
+            return f"任务队列已满（{eng.max_task_queue}个上限）"
+
+        await eng.submit_task({
+            "prompt": final_wf,
+            "workflow_name": wfn,
+            "user_id": uid,
+            "is_workflow": True,
+            "image_paths": [],
+            "workflow_config": cfg,
+            "callback": self._make_result_callback(event, "workflow")
+        })
+        title = cfg.get("name", wfn)
+        servers = [s.name for s in eng.comfyui_servers if s.healthy]
+        sf = f"\n可用服务器：{'、'.join(servers)}" if servers else ""
+        return f"Workflow「{title}」已加入队列（排队：{eng.task_queue.qsize()}个）{sf}"
 
     # ========== 清理 ==========
 
