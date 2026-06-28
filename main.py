@@ -1824,9 +1824,7 @@ background:linear-gradient(135deg,#667eea,#764ba2);min-height:100vh}}
 
     @llm_tool(name="comfyui_queue_status")
     async def comfyui_queue_status(self, event: AstrMessageEvent):
-        """Get current ComfyUI plugin queue and server status.
-        Args:
-        """
+        """Get current ComfyUI plugin queue and server status."""
         eng = self.engine
         if not self._check_group_whitelist(event):
             return "❌ 当前群聊不在白名单中！"
@@ -1920,7 +1918,7 @@ background:linear-gradient(135deg,#667eea,#764ba2);min-height:100vh}}
             await eng._decrement_user_task_count(uid)
             return f"任务队列已满（{eng.max_task_queue}个上限）"
 
-        await eng.submit_task({
+        submitted = await eng.submit_task({
             "prompt": final_wf,
             "workflow_name": wfn,
             "user_id": uid,
@@ -1929,6 +1927,9 @@ background:linear-gradient(135deg,#667eea,#764ba2);min-height:100vh}}
             "workflow_config": cfg,
             "callback": self._make_result_callback(event, "workflow")
         })
+        if not submitted:
+            await eng._decrement_user_task_count(uid)
+            return f"任务队列已满（{eng.max_task_queue}个上限）"
         title = cfg.get("name", wfn)
         servers = [s.name for s in eng.comfyui_servers if s.healthy]
         sf = f"\n可用服务器：{'、'.join(servers)}" if servers else ""
