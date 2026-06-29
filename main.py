@@ -18,13 +18,14 @@ import logging
 import os
 import random
 import re
+import shutil
 import threading
 import time
 import uuid
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
-from urllib.parse import quote
+from urllib.parse import quote, unquote, urlparse
 
 from astrbot.api import logger
 from astrbot.api.event import AstrMessageEvent, filter
@@ -32,6 +33,7 @@ from astrbot.api.event.filter import CustomFilter
 from astrbot.api.message_components import Image, Node, Nodes, Plain, Record, Reply, Video
 from astrbot.api.star import Context, Star, StarTools, register
 from astrbot.api import llm_tool
+from astrbot.core.utils.astrbot_path import get_astrbot_workspaces_path
 from aiohttp import web
 
 import sys
@@ -300,7 +302,7 @@ class ModComfyUI(Star):
 
         return _send_result
 
-    async def _download_to_temp(self, url: str, filename: str) -> Optional[str]:
+    async def _download_to_temp(self, url: str, filename: str, cleanup: bool = True) -> Optional[str]:
         """下载文件到临时目录"""
         import aiohttp
         try:
@@ -314,11 +316,179 @@ class ModComfyUI(Star):
             path = tmp_dir / filename
             loop = asyncio.get_event_loop()
             await loop.run_in_executor(None, lambda: path.write_bytes(data))
-            self._schedule_cleanup(str(path))
+            if cleanup:
+                self._schedule_cleanup(str(path))
             return str(path)
         except Exception as e:
             logger.warning(f"下载文件失败: {e}")
             return None
+
+    def _parse_image_inputs(self, image_inputs: Any) -> List[str]:
+        """解析 LLM 工具传入的图片数组，支持 URL 和本地路径。"""
+        if not image_inputs:
+            return []
+        if isinstance(image_inputs, (list, tuple)):
+            candidates = image_inputs
+        elif isinstance(image_inputs, str):
+            text = image_inputs.strip()
+            if not text:
+                return []
+            try:
+                decoded = json.loads(text)
+                if isinstance(decoded, (list, tuple)):
+                    candidates = decoded
+                else:
+                    candidates = [decoded]
+            except Exception:
+                candidates = re.split(r"[\n,，]+", text)
+        else:
+            candidates = [image_inputs]
+
+        images = []
+        for item in candidates:
+            image = str(item or "").strip()
+            if not image:
+                continue
+            parsed = urlparse(image)
+            if parsed.scheme and parsed.scheme not in ("http", "https", "file"):
+                raise ValueError(f"无效图片输入：{image[:120]}")
+            if parsed.scheme in ("http", "https") and not parsed.netloc:
+                raise ValueError(f"无效图片URL：{image[:120]}")
+            images.append(image)
+        return images
+
+    def _is_http_image_input(self, image_input: str) -> bool:
+        parsed = urlparse(image_input)
+        return parsed.scheme in ("http", "https")
+
+    def _image_input_to_local_path(self, image_input: str) -> str:
+        parsed = urlparse(image_input)
+        if parsed.scheme == "file":
+            path = unquote(parsed.path)
+            if os.name == "nt" and re.match(r"^/[a-zA-Z]:/", path):
+                path = path[1:]
+            return path
+        return image_input
+
+    def _workspace_root_for_event(self, event: AstrMessageEvent) -> Optional[Path]:
+        umo = getattr(event, "unified_msg_origin", None)
+        if not umo:
+            return None
+        normalized = re.sub(r"[^A-Za-z0-9._-]+", "_", str(umo).strip()) or "unknown"
+        return (Path(get_astrbot_workspaces_path()) / normalized).resolve(strict=False)
+
+    def _resolve_image_local_path(self, event: AstrMessageEvent, image_path: str) -> str:
+        path = self._image_input_to_local_path(image_path).strip()
+        if not path:
+            raise Exception("图片路径为空")
+        if os.path.isabs(path):
+            return path
+
+        workspace_root = self._workspace_root_for_event(event)
+        if workspace_root is None:
+            raise Exception("无法获取当前会话 workspace，不能使用相对图片路径")
+
+        candidate = (workspace_root / path).resolve(strict=False)
+        try:
+            candidate.relative_to(workspace_root)
+        except ValueError:
+            raise Exception("相对图片路径不能超出当前 workspace")
+        return str(candidate)
+
+    async def _download_image_url_for_workflow(self, url: str, index: int) -> str:
+        """下载 workflow 输入图片 URL 到临时文件。"""
+        parsed = urlparse(url)
+        ext = os.path.splitext(parsed.path)[1].lower()
+        if ext not in (".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp"):
+            ext = ".png"
+        filename = f"workflow_url_{uuid.uuid4().hex}_{index + 1}{ext}"
+        path = await self._download_to_temp(url, filename, cleanup=False)
+        if not path or not os.path.exists(path):
+            raise Exception("图片下载失败")
+        if os.path.getsize(path) < 10240:
+            raise Exception("图片文件过小")
+        return path
+
+    async def _copy_image_path_for_workflow(self, event: AstrMessageEvent,
+                                            image_path: str, index: int) -> str:
+        """复制 workflow 本地输入图片，避免原始文件被任务清理。"""
+        src = self._resolve_image_local_path(event, image_path)
+        if not os.path.exists(src):
+            raise Exception("图片文件不存在")
+        if not os.path.isfile(src):
+            raise Exception("图片路径不是文件")
+        if os.path.getsize(src) < 10240:
+            raise Exception("图片文件过小")
+
+        ext = os.path.splitext(src)[1].lower()
+        if ext not in (".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp"):
+            ext = ".png"
+        tmp_dir = self.data_dir / "temp"
+        tmp_dir.mkdir(exist_ok=True)
+        dst = tmp_dir / f"workflow_path_{uuid.uuid4().hex}_{index + 1}{ext}"
+        loop = asyncio.get_event_loop()
+        await loop.run_in_executor(None, lambda: shutil.copy2(src, dst))
+        return str(dst)
+
+    async def _collect_workflow_image_paths(self, event: AstrMessageEvent, wfn: str,
+                                            cfg: dict, image_inputs: Any = None) -> Tuple[List[str], Optional[str]]:
+        """收集 workflow 输入图片：优先使用传入图片输入，未传则从当前消息/引用上下文取图。"""
+        if not cfg.get("input_nodes"):
+            return [], None
+
+        eng = self.engine
+        uid = str(event.get_sender_id())
+        image_paths = []
+        try:
+            inputs = self._parse_image_inputs(image_inputs)
+        except Exception as e:
+            return [], str(e)
+
+        if inputs:
+            for i, image_input in enumerate(inputs):
+                try:
+                    if self._is_http_image_input(image_input):
+                        ip = await self._download_image_url_for_workflow(image_input, i)
+                    else:
+                        ip = await self._copy_image_path_for_workflow(event, image_input, i)
+                    if eng.enable_auto_save:
+                        saved = await eng.save_input_image_permanently(ip, "workflow", uid, wfn, i)
+                        if saved and saved != ip:
+                            self._schedule_cleanup(ip)
+                        image_paths.append(saved or ip)
+                    else:
+                        image_paths.append(ip)
+                except Exception as e:
+                    return [], f"第{i+1}张图片失败：{str(e)[:200]}"
+            return image_paths, None
+
+        msgs = event.get_messages()
+        img_segs = [m for m in msgs if isinstance(m, Image)]
+        reply = next((s for s in msgs if isinstance(s, Reply)), None)
+        if not img_segs and reply and reply.chain:
+            img_segs = [s for s in reply.chain if isinstance(s, Image)]
+        if not img_segs:
+            return [], "此workflow需要图片输入"
+
+        for i, seg in enumerate(img_segs):
+            try:
+                ip = await seg.convert_to_file_path()
+                if not os.path.exists(ip):
+                    raise Exception("文件下载失败")
+                fs = os.path.getsize(ip)
+                if fs < 10240:
+                    raise Exception("文件过小")
+                if eng.enable_auto_save:
+                    saved = await eng.save_input_image_permanently(ip, "workflow", uid, wfn, i)
+                    image_paths.append(saved or ip)
+                else:
+                    image_paths.append(ip)
+            except Exception as e:
+                err = str(e)
+                if "PERMANENT_ERROR:" in err:
+                    return [], err.replace("PERMANENT_ERROR:", "")
+                return [], f"第{i+1}张图片失败：{err[:200]}"
+        return image_paths, None
 
     async def _get_audio_duration(self, audio_path: str) -> Optional[float]:
         """获取音频时长"""
@@ -1298,37 +1468,10 @@ background:linear-gradient(135deg,#667eea,#764ba2);min-height:100vh}}
             return
 
         # 图片下载
-        image_paths = []
-        if cfg.get("input_nodes"):
-            msgs = event.get_messages()
-            img_segs = [m for m in msgs if isinstance(m, Image)]
-            reply = next((s for s in msgs if isinstance(s, Reply)), None)
-            if not img_segs and reply and reply.chain:
-                img_segs = [s for s in reply.chain if isinstance(s, Image)]
-            if not img_segs:
-                await self._send_with_auto_recall(event, event.plain_result("此workflow需要图片输入"))
-                return
-            uid = str(event.get_sender_id())
-            for i, seg in enumerate(img_segs):
-                try:
-                    ip = await seg.convert_to_file_path()
-                    if not os.path.exists(ip):
-                        raise Exception("文件下载失败")
-                    fs = os.path.getsize(ip)
-                    if fs < 10240:
-                        raise Exception("文件过小")
-                    if eng.enable_auto_save:
-                        saved = await eng.save_input_image_permanently(ip, "workflow", uid, wfn, i)
-                        image_paths.append(saved or ip)
-                    else:
-                        image_paths.append(ip)
-                except Exception as e:
-                    err = str(e)
-                    if "PERMANENT_ERROR:" in err:
-                        await self._send_with_auto_recall(event, event.plain_result(err.replace("PERMANENT_ERROR:", "")))
-                    else:
-                        await self._send_with_auto_recall(event, event.plain_result(f"第{i+1}张图片失败：{err[:200]}"))
-                    return
+        image_paths, image_err = await self._collect_workflow_image_paths(event, wfn, cfg)
+        if image_err:
+            await self._send_with_auto_recall(event, event.plain_result(image_err))
+            return
 
         # 构建 workflow
         final_wf = eng.build_workflow(wf_data, cfg, params, [])
@@ -1875,11 +2018,12 @@ background:linear-gradient(135deg,#667eea,#764ba2);min-height:100vh}}
 
     @llm_tool(name="comfyui_workflow_run")
     async def comfyui_workflow_run(self, event: AstrMessageEvent, workflow: str,
-                                   parameters: str = ""):
+                                   parameters: str = "", input_images: list = None):
         """Run a selected ComfyUI workflow with parameters.
         Args:
             workflow(string): Workflow id, prefix, or name from comfyui_workflow_list.
             parameters(string): Prefer a JSON object string, e.g. "{\"提示词\":\"cat with blue eyes\", \"宽\":1024}". Text like "提示词:cat 宽:1024" is accepted only for compatibility. Use parameter names or aliases shown by comfyui_workflow_list.
+            input_images(list): Optional image input array for workflows that need images. Use a JSON array, e.g. ["https://example.com/a.png", "/AstrBot/data/temp/a.png"]. Each item can be an http/https URL or a local path. Local paths support AstrBot temp directory files and non-sandbox workspace files. AstrBot temp directory paths usually contain data/temp; files retrieved from the sandbox with astrbot_download_file are automatically placed in the temp directory. If omitted, images are read from the current message or replied message context.
         """
         eng = self.engine
         if not self._check_group_whitelist(event):
@@ -1907,8 +2051,9 @@ background:linear-gradient(135deg,#667eea,#764ba2);min-height:100vh}}
         if errs:
             return "参数错误：\n" + "\n".join(errs)
 
-        if cfg.get("input_nodes"):
-            return "此workflow需要图片输入，AI工具暂不支持执行需要图片输入的workflow。请使用聊天workflow命令并附图或引用图片消息。"
+        image_paths, image_err = await self._collect_workflow_image_paths(event, wfn, cfg, input_images)
+        if image_err:
+            return image_err
 
         final_wf = eng.build_workflow(wf_data, cfg, params, [])
         uid = str(event.get_sender_id())
@@ -1923,7 +2068,7 @@ background:linear-gradient(135deg,#667eea,#764ba2);min-height:100vh}}
             "workflow_name": wfn,
             "user_id": uid,
             "is_workflow": True,
-            "image_paths": [],
+            "image_paths": image_paths,
             "workflow_config": cfg,
             "callback": self._make_result_callback(event, "workflow")
         })
