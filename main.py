@@ -560,127 +560,115 @@ class ModComfyUI(Star):
             return None
 
     async def _send_with_auto_recall(self, event: AstrMessageEvent, message_content: Any) -> Optional[int]:
-        """发送消息并根据配置自动撤回（仅撤回文本消息，与原版一致）"""
+        """发送消息并根据配置自动撤回（仅撤回纯文本消息，含图片/文件时不撤回）"""
         if not self.enable_auto_recall:
             await event.send(message_content)
             return None
 
-        has_non_text = False
-        if hasattr(message_content, '__iter__') and not isinstance(message_content, str):
-            try:
-                for component in message_content:
-                    if hasattr(component, '__class__'):
-                        class_name = component.__class__.__name__
-                        if 'Image' in class_name or 'File' in class_name:
-                            has_non_text = True
-                            break
-            except Exception:
-                has_non_text = True
-
         try:
-            from astrbot.core.platform.sources.aiocqhttp.aiocqhttp_message_event import AiocqhttpMessageEvent
-            if isinstance(event, AiocqhttpMessageEvent) and not has_non_text:
-                client = event.bot
-                group_id = event.get_group_id() if event.get_group_id() else None
-                sender_id = event.get_sender_id()
-                message_to_send = self._convert_to_cq_code(message_content)
-                if not message_to_send or not message_to_send.strip():
-                    await event.send(message_content)
-                    return None
-                if group_id:
-                    result = await client.send_group_msg(group_id=int(group_id), message=message_to_send)
-                else:
-                    result = await client.send_private_msg(user_id=int(sender_id), message=message_to_send)
-                asyncio.create_task(self._delayed_recall(event, result))
-                return result
-            else:
+            from astrbot.core.platform.sources.aiocqhttp.aiocqhttp_message_event import (
+                AiocqhttpMessageEvent,
+            )
+            if not isinstance(event, AiocqhttpMessageEvent):
                 await event.send(message_content)
                 return None
+
+            # 检查是否包含图片/文件 → 直接发送不撤回
+            if self._has_image_or_file(message_content):
+                await event.send(message_content)
+                return None
+
+            # 纯文本 → 用适配器的 _parse_onebot_json 序列化后通过 call_action 发送
+            from astrbot.core.message.message_event_result import MessageChain
+            from astrbot.api.message_components import Plain
+
+            if isinstance(message_content, str):
+                chain = [Plain(message_content)]
+            elif isinstance(message_content, MessageChain):
+                chain = message_content.chain
+            elif hasattr(message_content, '__iter__') and not isinstance(message_content, str):
+                chain = list(message_content)
+            else:
+                chain = [Plain(str(message_content))]
+
+            obmsg = await event._parse_onebot_json(MessageChain(chain=chain))
+            bot = event.bot
+            group_id = event.get_group_id()
+            sender_id = event.get_sender_id()
+
+            # 构造 routing_params（参考 aiocqhttp 适配器的做法）
+            routing_params = {}
+            if hasattr(event.message_obj, 'raw_message') and isinstance(event.message_obj.raw_message, dict):
+                sid = event.message_obj.raw_message.get('self_id')
+                if sid:
+                    routing_params['self_id'] = sid
+
+            if group_id:
+                result = await bot.call_action(
+                    'send_group_msg',
+                    group_id=int(group_id),
+                    message=obmsg,
+                    **routing_params,
+                )
+            else:
+                result = await bot.call_action(
+                    'send_private_msg',
+                    user_id=int(sender_id),
+                    message=obmsg,
+                    **routing_params,
+                )
+
+            # 提取 message_id
+            mid = None
+            if isinstance(result, dict):
+                mid = result.get('message_id') or result.get('id')
+            elif isinstance(result, (int, float)):
+                mid = int(result)
+            elif isinstance(result, str):
+                try:
+                    mid = int(result)
+                except ValueError:
+                    pass
+
+            if mid is not None:
+                asyncio.create_task(
+                    self._delayed_recall_by_id(bot, int(mid), routing_params)
+                )
+                logger.info(f"已安排 {self.auto_recall_delay}s 后撤回消息 ID: {mid}")
+            return result
         except Exception as e:
+            logger.warning(f"_send_with_auto_recall 异常: {e}")
             await event.send(message_content)
             return None
 
-    def _convert_to_cq_code(self, content: Any) -> str:
-        """将消息内容转换为 CQ 码格式（与原版一致，找到即返回）"""
-        if isinstance(content, str):
-            return content.strip()
-        # 方法1: 检查 message 属性/方法
-        if hasattr(content, 'message'):
-            attr = getattr(content, 'message')
-            if callable(attr):
-                try:
-                    msg = attr()
-                    text = self._extract_text_from_content(msg)
-                    if text:
-                        return text.strip()
-                except Exception:
-                    pass
-            else:
-                text = self._extract_text_from_content(attr)
-                if text:
-                    return text.strip()
-        # 方法2: 检查 chain 属性
-        if hasattr(content, 'chain'):
-            text = self._extract_text_from_content(content.chain)
-            if text:
-                return text.strip()
-        # 方法3: 可迭代对象
-        if hasattr(content, '__iter__') and not isinstance(content, str):
-            text = self._extract_text_from_content(content)
-            if text:
-                return text.strip()
-        # 方法4: 直接转字符串
-        try:
-            return str(content).strip()
-        except Exception:
-            return ""
-
     @staticmethod
-    def _extract_text_from_content(content: Any) -> str:
+    def _has_image_or_file(content: Any) -> bool:
+        """检查消息内容中是否包含图片或文件（含则跳过撤回）"""
         if isinstance(content, str):
-            return content
+            return False
+        from astrbot.core.message.message_event_result import MessageChain
+        if isinstance(content, MessageChain):
+            for component in content.chain:
+                if hasattr(component, '__class__'):
+                    class_name = component.__class__.__name__
+                    if 'Image' in class_name or 'File' in class_name:
+                        return True
+            return False
         if hasattr(content, '__iter__') and not isinstance(content, str):
-            parts = []
-            for comp in content:
-                if hasattr(comp, 'type') and hasattr(comp.type, 'value') and comp.type.value == 'Plain':
-                    parts.append(getattr(comp, 'text', ''))
-                elif hasattr(comp, 'text'):
-                    parts.append(comp.text)
-                elif isinstance(comp, str):
-                    parts.append(comp)
-                else:
-                    try:
-                        parts.append(str(comp))
-                    except Exception:
-                        pass
-            return ''.join(parts)
-        return getattr(content, 'text', str(content) if not hasattr(content, '__iter__') else '')
+            for component in content:
+                if hasattr(component, '__class__'):
+                    class_name = component.__class__.__name__
+                    if 'Image' in class_name or 'File' in class_name:
+                        return True
+        return False
 
-    async def _delayed_recall(self, event, sent_message):
+    async def _delayed_recall_by_id(self, bot, message_id: int, routing_params: dict):
+        """延迟后撤回指定 ID 的消息（参考 aiocqhttp 适配器的 call_action + routing_params 模式）"""
         try:
             await asyncio.sleep(self.auto_recall_delay)
-            mid = None
-            if hasattr(sent_message, 'message_id'):
-                mid = sent_message.message_id
-            elif isinstance(sent_message, int):
-                mid = sent_message
-            elif hasattr(sent_message, 'id'):
-                mid = sent_message.id
-            elif isinstance(sent_message, dict):
-                for k in ('message_id', 'id', 'msg_id'):
-                    if k in sent_message:
-                        mid = sent_message[k]
-                        break
-            elif isinstance(sent_message, str):
-                try:
-                    mid = int(sent_message)
-                except ValueError:
-                    pass
-            if mid is not None:
-                from astrbot.core.platform.sources.aiocqhttp.aiocqhttp_message_event import AiocqhttpMessageEvent
-                if isinstance(event, AiocqhttpMessageEvent):
-                    await event.bot.delete_msg(message_id=mid)
-                    logger.info(f"已自动撤回消息 ID: {mid}")
+            if message_id is not None:
+                await bot.call_action('delete_msg', message_id=message_id, **routing_params)
+                logger.info(f"已自动撤回消息 ID: {message_id}")
         except Exception as e:
             logger.warning(f"自动撤回失败: {e}")
 
