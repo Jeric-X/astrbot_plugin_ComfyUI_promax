@@ -183,14 +183,69 @@ class ModComfyUI(Star):
 
     # ========== 结果回调处理 ==========
 
+    @staticmethod
+    def _format_comfyui_error(error: str) -> str:
+        """将 ComfyUI 原始错误 JSON 解析为人类可读的错误描述"""
+        if not error:
+            return "未知错误"
+        # 尝试解析 JSON 格式的 ComfyUI 错误
+        try:
+            # 提取 JSON 部分（可能嵌在 Exception 文本中）
+            json_start = error.find('{')
+            if json_start >= 0:
+                err_data = json.loads(error[json_start:])
+            else:
+                return error[:500]
+            parts = []
+            # 顶层错误
+            if isinstance(err_data, dict):
+                err_obj = err_data.get("error", err_data)
+                if isinstance(err_obj, dict):
+                    err_type = err_obj.get("type", "")
+                    err_msg = err_obj.get("message", "")
+                    if err_type:
+                        parts.append(f"[{err_type}]")
+                    if err_msg:
+                        parts.append(err_msg)
+                # 节点级错误
+                node_errors = err_data.get("node_errors", {})
+                if node_errors:
+                    parts.append("\n节点错误详情：")
+                    for node_id, nd_err in node_errors.items():
+                        errs = nd_err.get("errors", [])
+                        for e in errs:
+                            etype = e.get("type", "")
+                            emsg = e.get("message", "")
+                            detail = e.get("details", "")
+                            extra = e.get("extra_info", {})
+                            input_name = extra.get("input_name", detail)
+                            display = extra.get("input_config", [])
+                            min_val = max_val = None
+                            if isinstance(display, list) and len(display) >= 2 and isinstance(display[1], dict):
+                                min_val = display[1].get("min")
+                                max_val = display[1].get("max")
+                            param_desc = input_name if input_name else detail
+                            # 构建可读的错误描述
+                            if etype == "value_smaller_than_min":
+                                parts.append(f"  • 节点 {node_id} 参数「{param_desc}」：{emsg}（最小值：{min_val}，当前值小于最小值，请使用 ≥{min_val} 的值）")
+                            elif etype == "value_bigger_than_max":
+                                parts.append(f"  • 节点 {node_id} 参数「{param_desc}」：{emsg}（最大值：{max_val}）")
+                            else:
+                                parts.append(f"  • 节点 {node_id} 参数「{param_desc}」：{emsg}")
+                return "\n".join(parts) if parts else error[:500]
+            return error[:500]
+        except Exception:
+            return error[:500]
+
     def _make_result_callback(self, event: AstrMessageEvent, task_type: str = "txt2img",
                                metadata: dict = None):
         """创建任务完成后的回调函数，负责将 WorkflowResult 发回给用户"""
         async def _send_result(result: WorkflowResult):
             try:
                 if not result.success:
+                    formatted = self._format_comfyui_error(result.error or '未知错误')
                     await self._send_with_auto_recall(
-                        event, event.plain_result(f"\n❌ 生成失败：{result.error or '未知错误'}")
+                        event, event.plain_result(f"\n❌ 生成失败：{formatted}")
                     )
                     return
                 
@@ -2056,6 +2111,18 @@ background:linear-gradient(135deg,#667eea,#764ba2);min-height:100vh}}
             return image_err
 
         final_wf = eng.build_workflow(wf_data, cfg, params, [])
+
+        # 后处理：遍历 workflow 所有节点，替换 seed=-1 为随机种子（ComfyUI 要求 seed ≥ 0）
+        for node_id, node_data in final_wf.items():
+            if isinstance(node_data, dict) and "inputs" in node_data:
+                seed_val = node_data["inputs"].get("seed")
+                if seed_val is not None:
+                    try:
+                        if int(seed_val) == -1:
+                            node_data["inputs"]["seed"] = random.randint(1, 18446744073709551615)
+                    except (ValueError, TypeError):
+                        pass
+
         uid = str(event.get_sender_id())
         if not await eng._increment_user_task_count(uid):
             return f"您的并发任务数已达上限（{eng.max_concurrent_tasks_per_user}个）"
