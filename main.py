@@ -2241,8 +2241,10 @@ background:linear-gradient(135deg,#667eea,#764ba2);min-height:100vh}}
     # ========== 伪造转发 ==========
 
     async def send_fake_forward_message(self, event: AstrMessageEvent, merged_chain: list, image_count: int):
-        """发送伪造转发消息（与原版 main1.py 一致）"""
-        if not self.enable_fake_forward or image_count < self.fake_forward_threshold:
+        """发送伪装转发消息。仅 QQ(aiocqhttp) 平台支持，其他平台直接走通用发送。"""
+        from astrbot.core.platform.sources.aiocqhttp.aiocqhttp_message_event import AiocqhttpMessageEvent
+        is_qq = isinstance(event, AiocqhttpMessageEvent)
+        if not is_qq or not self.enable_fake_forward or image_count < self.fake_forward_threshold:
             await event.send(event.chain_result(merged_chain))
             return
         try:
@@ -2272,9 +2274,9 @@ background:linear-gradient(135deg,#667eea,#764ba2);min-height:100vh}}
                             name=nickname, content=node_content)
 
             await event.send(event.chain_result([Nodes(nodes=[node])]))
-            logger.info(f"已使用伪造转发消息发送，QQ号: {fake_qq}, 昵称: {nickname}, 图片数量: {image_count}")
+            logger.info(f"已使用伪装转发消息发送，QQ号: {fake_qq}, 昵称: {nickname}, 图片数量: {image_count}")
         except Exception as e:
-            logger.error(f"发送伪造转发消息失败，使用普通发送方式: {e}")
+            logger.error(f"发送伪装转发消息失败，使用普通发送方式: {e}")
             await event.send(event.chain_result(merged_chain))
 
     async def _get_qq_nickname(self, event: AstrMessageEvent, qq_number: str) -> str:
