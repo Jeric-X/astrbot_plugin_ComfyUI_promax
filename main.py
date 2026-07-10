@@ -33,6 +33,8 @@ from astrbot.api.event.filter import CustomFilter
 from astrbot.api.message_components import Image, Node, Nodes, Plain, Record, Reply, Video
 from astrbot.api.star import Context, Star, StarTools, register
 from astrbot.api import llm_tool
+from astrbot.core.cron.events import CronMessageEvent
+from astrbot.core.platform.message_session import MessageSession
 from astrbot.core.utils.astrbot_path import get_astrbot_workspaces_path
 from aiohttp import web
 
@@ -244,6 +246,11 @@ class ModComfyUI(Star):
             try:
                 if not result.success:
                     formatted = self._format_comfyui_error(result.error or '未知错误')
+                    meta = result.metadata or {}
+                    if meta.get("is_ai_initiated"):
+                        task_id = meta.get("task_id") or "未知"
+                        if self._wake_main_agent_for_ai_task_failure(event, task_id, formatted):
+                            return
                     await self._send_with_auto_recall(
                         event, event.plain_result(f"\n❌ 生成失败：{formatted}")
                     )
@@ -431,6 +438,37 @@ class ModComfyUI(Star):
             return None
         normalized = re.sub(r"[^A-Za-z0-9._-]+", "_", str(umo).strip()) or "unknown"
         return (Path(get_astrbot_workspaces_path()) / normalized).resolve(strict=False)
+
+    def _wake_main_agent_for_ai_task_failure(self, event: AstrMessageEvent,
+                                             task_id: str, error: str) -> bool:
+        """将 AI 发起的后台任务失败交回主 Agent 处理。"""
+        umo = getattr(event, "unified_msg_origin", None)
+        if not umo:
+            logger.warning("AI任务失败但缺少 unified_msg_origin，无法唤醒主 Agent")
+            return False
+        try:
+            session = MessageSession.from_str(str(umo))
+            message = (
+                "ComfyUI 任务执行失败，请结合当前会话上下文向用户说明并决定下一步。\n"
+                f"任务ID：{task_id or '未知'}\n"
+                f"错误信息：{error or '未知错误'}"
+            )
+            cron_event = CronMessageEvent(
+                context=self.context,
+                session=session,
+                message=message,
+                message_type=session.message_type,
+                extras={
+                    "trigger_source": "comfyui_ai_task_failure",
+                    "task_id": task_id,
+                    "error": error,
+                },
+            )
+            self.context.get_event_queue().put_nowait(cron_event)
+            return True
+        except Exception as e:
+            logger.error(f"唤醒主 Agent 处理AI任务失败时出错: {e}")
+            return False
 
     def _resolve_image_local_path(self, event: AstrMessageEvent, image_path: str) -> str:
         path = self._image_input_to_local_path(image_path).strip()
@@ -1348,11 +1386,14 @@ background:linear-gradient(135deg,#667eea,#764ba2);min-height:100vh}}
             await self._send_with_auto_recall(event, event.plain_result(f"\n任务队列已满（{eng.max_task_queue}个）！"))
             return
 
+        task_id = await eng.generate_task_id("txt2img")
         await eng.submit_task({
+            "task_id": task_id,
             "prompt": pure, "current_seed": seed,
             "current_width": w, "current_height": h,
             "current_batch_size": bs, "lora_list": lora_list,
             "selected_model": selected_model, "user_id": uid,
+            "is_ai_initiated": False,
             "callback": self._make_result_callback(event, "txt2img")
         })
 
@@ -1362,7 +1403,7 @@ background:linear-gradient(135deg,#667eea,#764ba2);min-height:100vh}}
             mf = f"\n使用模型：{md}"
 
         await self._send_with_auto_recall(event, event.plain_result(
-            f"\n文生图任务已加入队列（排队：{eng.task_queue.qsize()}个）\n"
+            f"\n文生图任务已加入队列（任务ID：{task_id}，排队：{eng.task_queue.qsize()}个）\n"
             f"提示词：{self._truncate_prompt(pure)}\nSeed：{seed}\n"
             f"分辨率：{w}x{h}\n批量数：{bs}"
             + mf
@@ -1453,17 +1494,20 @@ background:linear-gradient(135deg,#667eea,#764ba2);min-height:100vh}}
             await self._send_with_auto_recall(event, event.plain_result(f"\n任务队列已满！"))
             return
 
+        task_id = await eng.generate_task_id("img2img")
         await eng.submit_task({
+            "task_id": task_id,
             "prompt": pure, "current_seed": seed,
             "current_width": eng.default_width, "current_height": eng.default_height,
             "current_batch_size": bs, "lora_list": lora_list,
             "selected_model": selected_model, "user_id": uid,
             "img_path": img_path, "denoise": denoise,
+            "is_ai_initiated": False,
             "callback": self._make_result_callback(event, "img2img")
         })
 
         await self._send_with_auto_recall(event, event.plain_result(
-            f"\n图生图任务已加入队列（排队：{eng.task_queue.qsize()}个）\n"
+            f"\n图生图任务已加入队列（任务ID：{task_id}，排队：{eng.task_queue.qsize()}个）\n"
             f"提示词：{self._truncate_prompt(pure)}\nSeed：{seed}\n噪声：{denoise}"
         ))
 
@@ -1529,15 +1573,18 @@ background:linear-gradient(135deg,#667eea,#764ba2);min-height:100vh}}
             await self._send_with_auto_recall(event, event.plain_result("队列已满"))
             return
 
+        task_id = await eng.generate_task_id(wfn)
         await eng.submit_task({
+            "task_id": task_id,
             "prompt": final_wf,
             "workflow_name": wfn, "user_id": uid,
             "is_workflow": True, "image_paths": image_paths,
             "workflow_config": cfg,
+            "is_ai_initiated": False,
             "callback": self._make_result_callback(event, "workflow")
         })
         await self._send_with_auto_recall(event, event.plain_result(
-            f"Workflow「{cfg['name']}」已加入队列（排队：{eng.task_queue.qsize()}个）"
+            f"Workflow「{cfg['name']}」已加入队列（任务ID：{task_id}，排队：{eng.task_queue.qsize()}个）"
         ))
 
     async def _send_workflow_help(self, event: AstrMessageEvent, prefix: str):
@@ -1974,6 +2021,9 @@ background:linear-gradient(135deg,#667eea,#764ba2);min-height:100vh}}
             prompt(string): A prompt for text to image, if the user inputs Chinese prompts, they need to be translated into English.
             img_width(number): The width of the generated image. Optional.
             img_height(number): The height of the generated image. Optional.
+
+        Returns:
+            string: Submission status. On success, includes a task ID for later reference.
         """
         eng = self.engine
         if not self._check_group_whitelist(event):
@@ -1997,16 +2047,19 @@ background:linear-gradient(135deg,#667eea,#764ba2);min-height:100vh}}
         if eng.task_queue.full():
             await eng._decrement_user_task_count(uid)
             return f"任务队列已满（{eng.max_task_queue}个上限）"
+        task_id = await eng.generate_task_id("txt2img")
         await eng.submit_task({
+            "task_id": task_id,
             "prompt": prompt, "current_seed": seed,
             "current_width": w, "current_height": h,
             "current_batch_size": 1, "lora_list": [],
             "selected_model": None, "user_id": uid,
+            "is_ai_initiated": True,
             "callback": self._make_result_callback(event, "llm_tool")
         })
         servers = [s.name for s in eng.comfyui_servers if s.healthy]
         sf = f"\n可用服务器：{'、'.join(servers)}" if servers else "\n当前无可用服务器，任务将在服务器恢复后处理"
-        return f"文生图任务已加入队列（排队：{eng.task_queue.qsize()}个）\n提示词：{prompt}\nSeed：{seed}\n分辨率：{w}x{h}{sf}"
+        return f"文生图任务已加入队列（任务ID：{task_id}，排队：{eng.task_queue.qsize()}个）\n提示词：{prompt}\nSeed：{seed}\n分辨率：{w}x{h}{sf}"
 
     @llm_tool(name="comfyui_queue_status")
     async def comfyui_queue_status(self, event: AstrMessageEvent):
@@ -2067,6 +2120,9 @@ background:linear-gradient(135deg,#667eea,#764ba2);min-height:100vh}}
             workflow(string): Workflow id, prefix, or name from comfyui_workflow_list.
             parameters(string): Prefer a JSON object string, e.g. "{\"提示词\":\"cat with blue eyes\", \"宽\":1024}". Text like "提示词:cat 宽:1024" is accepted only for compatibility. Use parameter names or aliases shown by comfyui_workflow_list.
             input_images(list): Optional image input array for workflows that need images. Use a JSON array, e.g. ["https://example.com/a.png", "/AstrBot/data/temp/a.png"]. Each item can be an http/https URL or a local path. Local paths support AstrBot temp directory files and non-sandbox workspace files. AstrBot temp directory paths usually contain data/temp; files retrieved from the sandbox with astrbot_download_file are automatically placed in the temp directory. If omitted, images are read from the current message or replied message context.
+
+        Returns:
+            string: Submission status. On success, includes a task ID for later reference.
         """
         eng = self.engine
         if not self._check_group_whitelist(event):
@@ -2118,13 +2174,16 @@ background:linear-gradient(135deg,#667eea,#764ba2);min-height:100vh}}
             await eng._decrement_user_task_count(uid)
             return f"任务队列已满（{eng.max_task_queue}个上限）"
 
+        task_id = await eng.generate_task_id(wfn)
         submitted = await eng.submit_task({
+            "task_id": task_id,
             "prompt": final_wf,
             "workflow_name": wfn,
             "user_id": uid,
             "is_workflow": True,
             "image_paths": image_paths,
             "workflow_config": cfg,
+            "is_ai_initiated": True,
             "callback": self._make_result_callback(event, "workflow")
         })
         if not submitted:
@@ -2133,7 +2192,7 @@ background:linear-gradient(135deg,#667eea,#764ba2);min-height:100vh}}
         title = cfg.get("name", wfn)
         servers = [s.name for s in eng.comfyui_servers if s.healthy]
         sf = f"\n可用服务器：{'、'.join(servers)}" if servers else ""
-        return f"Workflow「{title}」已加入队列（排队：{eng.task_queue.qsize()}个）{sf}"
+        return f"Workflow「{title}」已加入队列（任务ID：{task_id}，排队：{eng.task_queue.qsize()}个）{sf}"
 
     # ========== 清理 ==========
 

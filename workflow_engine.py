@@ -17,6 +17,7 @@ ComfyUI 工作流处理引擎 — 与 AstrBot/QQ 平台解耦的纯业务逻辑�
 import aiohttp
 import asyncio
 import copy
+import hashlib
 import json
 import logging
 import os
@@ -236,6 +237,8 @@ class WorkflowEngine:
         self.server_monitor_running: bool = False
         self.user_task_counts: Dict[str, int] = {}
         self.user_task_lock = asyncio.Lock()
+        self.task_id_seq: int = 0
+        self.task_id_lock = asyncio.Lock()
         self.server_poll_lock = asyncio.Lock()
         self.server_state_lock = asyncio.Lock()
 
@@ -552,6 +555,22 @@ class WorkflowEngine:
 
     # ==================== 任务提交与处理 ====================
 
+    @staticmethod
+    def _safe_task_id_name(name: str) -> str:
+        safe_name = re.sub(r"[^\w-]+", "_", str(name or ""), flags=re.UNICODE).strip("_")
+        return safe_name or "workflow"
+
+    async def generate_task_id(self, workflow_name: str) -> str:
+        """生成短任务ID：{workflow_name}_{seq_num}_{6位毫秒时间戳hash}。"""
+        async with self.task_id_lock:
+            self.task_id_seq += 1
+            seq_num = self.task_id_seq
+
+        safe_name = self._safe_task_id_name(workflow_name)
+        time_ms = time.time_ns() // 1_000_000
+        time_hash = hashlib.sha256(str(time_ms).encode("utf-8")).hexdigest()[:6].upper()
+        return f"{safe_name}_{seq_num}_{time_hash}"
+
     async def submit_task(self, task_data: dict) -> bool:
         """
         提交任务到引擎队列
@@ -743,7 +762,16 @@ class WorkflowEngine:
                         return
                     logger.error(f"{worker_name}处理任务失败：{str(e)[:500]}")
                     # 通过回调通知用户错误
-                    err_result = WorkflowResult(success=False, error=str(e)[:1000])
+                    err_result = WorkflowResult(
+                        success=False,
+                        error=str(e)[:1000],
+                        metadata={
+                            "task_id": task_data.get("task_id"),
+                            "workflow_name": task_data.get("workflow_name"),
+                            "is_workflow": task_data.get("is_workflow", False),
+                            "is_ai_initiated": task_data.get("is_ai_initiated", False),
+                        }
+                    )
                     if cb := task_data.get("callback"):
                         if asyncio.iscoroutinefunction(cb):
                             asyncio.create_task(cb(err_result))
@@ -1034,6 +1062,7 @@ class WorkflowEngine:
         output_mappings = config.get("output_mappings", {})
         result = WorkflowResult()
         result.metadata = {
+            "task_id": task_data.get("task_id"),
             "workflow_name": workflow_name,
             "workflow_title": config.get("name", workflow_name),
             "server_name": server.name,
