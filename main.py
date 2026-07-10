@@ -1387,7 +1387,7 @@ background:linear-gradient(135deg,#667eea,#764ba2);min-height:100vh}}
             return
 
         task_id = await eng.generate_task_id("txt2img")
-        await eng.submit_task({
+        submitted = await eng.submit_task({
             "task_id": task_id,
             "prompt": pure, "current_seed": seed,
             "current_width": w, "current_height": h,
@@ -1396,6 +1396,10 @@ background:linear-gradient(135deg,#667eea,#764ba2);min-height:100vh}}
             "is_ai_initiated": False,
             "callback": self._make_result_callback(event, "txt2img")
         })
+        if not submitted:
+            await eng._decrement_user_task_count(uid)
+            await self._send_with_auto_recall(event, event.plain_result(f"\n任务队列已满（{eng.max_task_queue}个）！"))
+            return
 
         mf = ""
         if selected_model:
@@ -1495,7 +1499,7 @@ background:linear-gradient(135deg,#667eea,#764ba2);min-height:100vh}}
             return
 
         task_id = await eng.generate_task_id("img2img")
-        await eng.submit_task({
+        submitted = await eng.submit_task({
             "task_id": task_id,
             "prompt": pure, "current_seed": seed,
             "current_width": eng.default_width, "current_height": eng.default_height,
@@ -1505,6 +1509,10 @@ background:linear-gradient(135deg,#667eea,#764ba2);min-height:100vh}}
             "is_ai_initiated": False,
             "callback": self._make_result_callback(event, "img2img")
         })
+        if not submitted:
+            await eng._decrement_user_task_count(uid)
+            await self._send_with_auto_recall(event, event.plain_result(f"\n任务队列已满！"))
+            return
 
         await self._send_with_auto_recall(event, event.plain_result(
             f"\n图生图任务已加入队列（任务ID：{task_id}，排队：{eng.task_queue.qsize()}个）\n"
@@ -1574,7 +1582,7 @@ background:linear-gradient(135deg,#667eea,#764ba2);min-height:100vh}}
             return
 
         task_id = await eng.generate_task_id(wfn)
-        await eng.submit_task({
+        submitted = await eng.submit_task({
             "task_id": task_id,
             "prompt": final_wf,
             "workflow_name": wfn, "user_id": uid,
@@ -1583,6 +1591,10 @@ background:linear-gradient(135deg,#667eea,#764ba2);min-height:100vh}}
             "is_ai_initiated": False,
             "callback": self._make_result_callback(event, "workflow")
         })
+        if not submitted:
+            await eng._decrement_user_task_count(uid)
+            await self._send_with_auto_recall(event, event.plain_result("队列已满"))
+            return
         await self._send_with_auto_recall(event, event.plain_result(
             f"Workflow「{cfg['name']}」已加入队列（任务ID：{task_id}，排队：{eng.task_queue.qsize()}个）"
         ))
@@ -2048,7 +2060,7 @@ background:linear-gradient(135deg,#667eea,#764ba2);min-height:100vh}}
             await eng._decrement_user_task_count(uid)
             return f"任务队列已满（{eng.max_task_queue}个上限）"
         task_id = await eng.generate_task_id("txt2img")
-        await eng.submit_task({
+        submitted = await eng.submit_task({
             "task_id": task_id,
             "prompt": prompt, "current_seed": seed,
             "current_width": w, "current_height": h,
@@ -2057,6 +2069,9 @@ background:linear-gradient(135deg,#667eea,#764ba2);min-height:100vh}}
             "is_ai_initiated": True,
             "callback": self._make_result_callback(event, "llm_tool")
         })
+        if not submitted:
+            await eng._decrement_user_task_count(uid)
+            return f"任务队列已满（{eng.max_task_queue}个上限）"
         servers = [s.name for s in eng.comfyui_servers if s.healthy]
         sf = f"\n可用服务器：{'、'.join(servers)}" if servers else "\n当前无可用服务器，任务将在服务器恢复后处理"
         return f"文生图任务已加入队列（任务ID：{task_id}，排队：{eng.task_queue.qsize()}个）\n提示词：{prompt}\nSeed：{seed}\n分辨率：{w}x{h}{sf}"

@@ -558,7 +558,8 @@ class WorkflowEngine:
     @staticmethod
     def _safe_task_id_name(name: str) -> str:
         safe_name = re.sub(r"[^\w-]+", "_", str(name or ""), flags=re.UNICODE).strip("_")
-        return safe_name or "workflow"
+        safe_name = safe_name or "workflow"
+        return safe_name[:48]
 
     async def generate_task_id(self, workflow_name: str) -> str:
         """生成短任务ID：{workflow_name}_{seq_num}_{6位毫秒时间戳hash}。"""
