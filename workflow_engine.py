@@ -173,6 +173,7 @@ class WorkflowEngine:
         self.max_height = config.get("max_height", 2000)
         
         # ---- 轮询/队列 ----
+        self.task_timeout = config.get("task_timeout", 600)
         self.queue_check_delay = config.get("queue_check_delay", 30)
         self.queue_check_interval = config.get("queue_check_interval", 5)
         self.empty_queue_max_retry = config.get("empty_queue_max_retry", 2)
@@ -337,7 +338,7 @@ class WorkflowEngine:
             ("max_task_queue", int), ("min_width", int), ("max_width", int),
             ("min_height", int), ("max_height", int), ("num_inference_steps", int),
             ("default_denoise", (int, float)), ("open_time_ranges", str),
-            ("queue_check_delay", int), ("queue_check_interval", int),
+            ("task_timeout", int), ("queue_check_delay", int), ("queue_check_interval", int),
             ("empty_queue_max_retry", int), ("lora_config", list),
             ("max_concurrent_tasks_per_user", int)
         ]
@@ -345,6 +346,8 @@ class WorkflowEngine:
             val = getattr(self, key, None)
             if not isinstance(val, typ):
                 raise ValueError(f"配置项错误：{key}（需为{typ.__name__}类型）")
+        if self.task_timeout <= 0:
+            raise ValueError("配置项错误：task_timeout 必须大于 0")
         if not self.parsed_time_ranges:
             logger.warning(f"开放时间格式错误，使用默认时间段")
             self.open_time_ranges = "7:00-8:00,11:00-14:00,17:00-24:00"
@@ -847,8 +850,9 @@ class WorkflowEngine:
                 return data.get("prompt_id", "")
 
     async def poll_task_status(self, server: ServerState, prompt_id: str,
-                                timeout: int = 600, interval: int = 3) -> dict:
+                                timeout: Optional[int] = None, interval: int = 3) -> dict:
         """轮询任务状态直到完成"""
+        timeout = self.task_timeout if timeout is None else timeout
         url = f"{server.url}/history/{prompt_id}"
         start_time = asyncio.get_event_loop().time()
         empty_queue_retry = 0
