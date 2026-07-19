@@ -46,6 +46,14 @@ IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp", ".tiff"}
 MODEL_EXTENSIONS = {".glb", ".gltf", ".obj", ".fbx", ".stl", ".ply"}
 
 
+class ServerCommunicationError(Exception):
+    """应影响 ComfyUI 服务器健康度的 API 异常。
+
+    能识别为标准 ComfyUI ``error`` / ``node_errors`` 的业务错误不使用
+    此异常；其余无法识别的 API 错误响应会使用此异常并计入健康度。
+    """
+
+
 def classify_output_file(filename: str, media_format: str = "", output_key: str = "") -> str:
     """将 ComfyUI UI 输出归类为可发送的媒体或通用文件。"""
     suffix = os.path.splitext(filename)[1].lower()
@@ -753,6 +761,43 @@ class WorkflowEngine:
                 if not server.healthy:
                     server.healthy = True
 
+    @staticmethod
+    def _is_server_communication_error(error: Exception) -> bool:
+        """判断异常是否说明 ComfyUI 服务器本身不可用。
+
+        不要把工作流校验、节点执行、任务超时或输出解析失败归入这里，
+        否则一个错误的 workflow 会把健康服务器错误地下线。
+        """
+        return isinstance(error, (
+            ServerCommunicationError,
+            aiohttp.ClientConnectionError,
+            aiohttp.ServerDisconnectedError,
+            aiohttp.ServerTimeoutError,
+            asyncio.TimeoutError,
+        ))
+
+    @staticmethod
+    def _is_recognized_comfyui_error(error_text: str) -> bool:
+        """判断响应是否为 main.py 能转换为可读文字的 ComfyUI 业务错误。
+
+        ComfyUI 的 /prompt 校验失败会在 JSON 中提供 ``error`` 和/或
+        ``node_errors``。这类错误表示服务器已经正常处理了请求，不应被
+        当作连接故障；无法识别的错误响应仍需影响健康度。
+        """
+        try:
+            json_start = (error_text or "").find("{")
+            if json_start < 0:
+                return False
+            error_data = json.loads(error_text[json_start:])
+            if not isinstance(error_data, dict):
+                return False
+            return (
+                isinstance(error_data.get("error"), dict)
+                or isinstance(error_data.get("node_errors"), dict)
+            )
+        except (json.JSONDecodeError, TypeError, ValueError):
+            return False
+
     async def _worker_loop(self, worker_name: str, server: ServerState):
         logger.info(f"{worker_name}已启动，绑定到服务器{server.name}")
         try:
@@ -830,7 +875,14 @@ class WorkflowEngine:
             await self._reset_server_failure(server)
             return result
         except Exception as e:
-            await self._handle_server_failure(server)
+            # 轮询期间可能已经记录过本次通信故障；服务器被标为不健康后
+            # 不再重复加一次，避免一次请求把计数从 3 误加到 4。
+            if self._is_server_communication_error(e) and server.healthy:
+                await self._handle_server_failure(server)
+            elif not self._is_server_communication_error(e):
+                logger.info(
+                    f"任务执行失败，不计入服务器{server.name}连接失败：{str(e)[:500]}"
+                )
             raise
         finally:
             if user_id:
@@ -853,9 +905,15 @@ class WorkflowEngine:
             async with session.post(f"{server.url}/upload/image", data=form) as resp:
                 if resp.status != 200:
                     text = await resp.text()
-                    raise Exception(f"图片上传失败（HTTP {resp.status}）：{self._filter_server_urls(text[:50])}")
+                    error = f"图片上传失败（HTTP {resp.status}）：{self._filter_server_urls(text[:50])}"
+                    if self._is_recognized_comfyui_error(text):
+                        raise Exception(error)
+                    raise ServerCommunicationError(error)
                 data = await resp.json()
-                return data.get("name", "")
+                name = data.get("name", "")
+                if not name:
+                    raise ServerCommunicationError("图片上传响应中缺少文件名")
+                return name
 
     async def send_comfyui_prompt(self, server: ServerState, prompt: dict) -> str:
         """发送 prompt 到 ComfyUI，返回 prompt_id"""
@@ -867,9 +925,15 @@ class WorkflowEngine:
             ) as resp:
                 if resp.status != 200:
                     text = await resp.text()
-                    raise Exception(f"任务下发失败（HTTP {resp.status}）：{self._filter_server_urls(text[:50000])}")
+                    error = f"任务下发失败（HTTP {resp.status}）：{self._filter_server_urls(text[:50000])}"
+                    if self._is_recognized_comfyui_error(text):
+                        raise Exception(error)
+                    raise ServerCommunicationError(error)
                 data = await resp.json()
-                return data.get("prompt_id", "")
+                prompt_id = data.get("prompt_id", "")
+                if not prompt_id:
+                    raise ServerCommunicationError("任务下发响应中缺少 prompt_id")
+                return prompt_id
 
     async def poll_task_status(self, server: ServerState, prompt_id: str,
                                 timeout: Optional[int] = None, interval: int = 3) -> dict:
@@ -898,11 +962,14 @@ class WorkflowEngine:
                                 return task_data
                         else:
                             await self._handle_server_failure(server)
+                            if not server.healthy:
+                                raise ServerCommunicationError(
+                                    f"查询任务状态失败（HTTP {resp.status}）"
+                                )
                 except (aiohttp.ClientError, asyncio.TimeoutError) as e:
                     if not server.healthy:
                         raise
-                    if isinstance(e, (asyncio.TimeoutError, aiohttp.ClientConnectorError,
-                                      aiohttp.ClientOSError, aiohttp.ServerDisconnectedError)):
+                    if self._is_server_communication_error(e):
                         await self._handle_server_failure(server)
                         if not server.healthy:
                             raise
