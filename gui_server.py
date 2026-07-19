@@ -9,6 +9,7 @@ import logging
 import os
 import shutil
 import threading
+from abc import ABC, abstractmethod
 from functools import wraps
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -16,6 +17,79 @@ from typing import Any, Dict, List, Optional
 from flask import Flask, flash, redirect, render_template, request, session, url_for
 
 logger = logging.getLogger("GuiServer")
+
+
+class GuiServerRuntime(ABC):
+    """可由插件统一管理生命周期的 WSGI 服务器运行时。"""
+
+    name: str
+
+    @abstractmethod
+    def start(self) -> None:
+        """开始监听。"""
+
+    @abstractmethod
+    def stop(self) -> None:
+        """停止监听并释放端口。"""
+
+
+class WaitressRuntime(GuiServerRuntime):
+    """Waitress 的可控运行时封装。"""
+
+    name = "Waitress"
+
+    def __init__(self, app: Flask, host: str, port: int):
+        self.app = app
+        self.host = host
+        self.port = port
+        self.server = None
+        self.thread: Optional[threading.Thread] = None
+
+    def start(self) -> None:
+        from waitress import create_server
+
+        self.server = create_server(self.app, host=self.host, port=self.port, threads=4)
+        self.thread = threading.Thread(target=self.server.run, daemon=True)
+        self.thread.start()
+
+    def stop(self) -> None:
+        if not self.server:
+            return
+        self.server.close()
+        if self.thread and self.thread is not threading.current_thread():
+            self.thread.join(timeout=5)
+        self.server = None
+        self.thread = None
+
+
+class WerkzeugRuntime(GuiServerRuntime):
+    """Werkzeug 的可控运行时封装，作为 Waitress 不可用时的回退。"""
+
+    name = "Werkzeug"
+
+    def __init__(self, app: Flask, host: str, port: int):
+        self.app = app
+        self.host = host
+        self.port = port
+        self.server = None
+        self.thread: Optional[threading.Thread] = None
+
+    def start(self) -> None:
+        from werkzeug.serving import make_server
+
+        self.server = make_server(self.host, self.port, self.app, threaded=True)
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.thread.start()
+
+    def stop(self) -> None:
+        if not self.server:
+            return
+        self.server.shutdown()
+        self.server.server_close()
+        if self.thread and self.thread is not threading.current_thread():
+            self.thread.join(timeout=5)
+        self.server = None
+        self.thread = None
 
 
 class ConfigManager:
@@ -104,8 +178,8 @@ class GuiServer:
         self.gui_password = gui_password
 
         self.app: Optional[Flask] = None
-        self.gui_thread: Optional[threading.Thread] = None
         self.gui_running = False
+        self._runtime: Optional[GuiServerRuntime] = None
         self._config_manager: Optional[ConfigManager] = None
 
     @property
@@ -287,66 +361,43 @@ class GuiServer:
             return redirect(url_for('index'))
 
     def start(self) -> bool:
-        """在新线程中启动 GUI 服务器"""
+        """启动 GUI 服务器运行时。"""
         if self.gui_running or not self.app:
             return False
 
-        def run():
+        try:
             try:
-                logger.info(f"启动ComfyUI配置管理界面...")
-                logger.info(f"配置目录: {self.config_dir}")
-                logger.info(f"工作流目录: {self.workflow_dir}")
-                logger.info(f"访问地址: http://0.0.0.0:{self.gui_port}")
-                logger.info(f"管理员账号: {self.gui_username}")
-                logger.info("=" * 50)
+                runtime: GuiServerRuntime = WaitressRuntime(
+                    self.app, '0.0.0.0', self.gui_port
+                )
+                runtime.start()
+            except ImportError:
+                runtime = WerkzeugRuntime(self.app, '0.0.0.0', self.gui_port)
+                runtime.start()
+        except Exception as e:
+            logger.error(f"GUI服务器启动失败: {e}")
+            return False
 
-                try:
-                    import importlib.util
-                    if importlib.util.find_spec("gunicorn") is not None:
-                        from gunicorn.app.base import BaseApplication
-
-                        class GunicornApp(BaseApplication):
-                            def __init__(self, app, options=None):
-                                self.options = options or {}
-                                self.application = app
-                                super().__init__()
-                            def load_config(self):
-                                cfg = {k: v for k, v in self.options.items()
-                                       if k in self.cfg.settings and v is not None}
-                                for k, v in cfg.items():
-                                    self.cfg.set(k.lower(), v)
-                            def load(self):
-                                return self.application
-
-                        GunicornApp(self.app, {
-                            'bind': f'0.0.0.0:{self.gui_port}',
-                            'workers': 2, 'threads': 2, 'worker_class': 'gthread',
-                            'timeout': 120, 'keepalive': 2, 'max_requests': 1000,
-                            'max_requests_jitter': 100, 'preload_app': True,
-                            'accesslog': '-', 'errorlog': '-', 'loglevel': 'info'
-                        }).run()
-                    elif importlib.util.find_spec("waitress") is not None:
-                        from waitress import serve
-                        logger.info("使用 Waitress WSGI 服务器")
-                        serve(self.app, host='0.0.0.0', port=self.gui_port, threads=4)
-                    else:
-                        logger.info("使用 Flask 开发服务器")
-                        self.app.run(host='0.0.0.0', port=self.gui_port, debug=False, threaded=True)
-                except Exception:
-                    logger.info("使用 Flask 开发服务器")
-                    self.app.run(host='0.0.0.0', port=self.gui_port, debug=False, threaded=True)
-            except Exception as e:
-                logger.error(f"GUI服务器启动失败: {e}")
-
-        self.gui_thread = threading.Thread(target=run, daemon=True)
-        self.gui_thread.start()
+        self._runtime = runtime
         self.gui_running = True
-        logger.info("GUI服务器已启动")
+        logger.info(f"GUI服务器已启动（{runtime.name}）")
+        logger.info(f"配置目录: {self.config_dir}")
+        logger.info(f"工作流目录: {self.workflow_dir}")
+        logger.info(f"访问地址: http://0.0.0.0:{self.gui_port}")
+        logger.info(f"管理员账号: {self.gui_username}")
         return True
 
     def stop(self) -> None:
-        """停止 GUI 服务器"""
-        if self.gui_running:
-            logger.info("正在停止GUI服务器...")
-            self.gui_running = False
+        """统一停止当前 GUI 服务器运行时。"""
+        runtime = self._runtime
+        if not runtime:
+            return
+        logger.info("正在停止GUI服务器...")
+        self.gui_running = False
+        try:
+            runtime.stop()
             logger.info("GUI服务器已停止")
+        except Exception as e:
+            logger.warning(f"停止GUI服务器失败: {e}")
+        finally:
+            self._runtime = None

@@ -38,14 +38,9 @@ from astrbot.core.platform.message_session import MessageSession
 from astrbot.core.utils.astrbot_path import get_astrbot_workspaces_path
 from aiohttp import web
 
-import sys
-import os
-# AstrBot 通过 __import__ 导入插件时，当前目录不一定在 sys.path 中
-_plugin_dir = os.path.dirname(os.path.abspath(__file__))
-if _plugin_dir not in sys.path:
-    sys.path.insert(0, _plugin_dir)
-from workflow_engine import WorkflowEngine, WorkflowResult
-from gui_server import GuiServer
+# 使用包内导入：AstrBot 重载时会清理 data.plugins.<插件名> 下的所有模块缓存。
+from .workflow_engine import WorkflowEngine, WorkflowResult
+from .gui_server import GuiServer
 
 # 模块级 WorkflowFilter — 直接引用引擎的 workflow_prefixes
 _workflow_engine_ref: Optional[WorkflowEngine] = None
@@ -2251,10 +2246,16 @@ background:linear-gradient(135deg,#667eea,#764ba2);min-height:100vh}}
                     except asyncio.CancelledError:
                         pass
                     srv.worker = None
+            if self.gui_server:
+                self.gui_server.stop()
             await self._stop_help_server()
             logger.info("清理完成")
         except Exception as e:
             logger.error(f"清理时出错: {e}")
+
+    async def terminate(self) -> None:
+        """AstrBot 热重载/卸载生命周期入口。"""
+        await self.cleanup()
 
     # ========== 消息发送工具（文件上传） ==========
 
