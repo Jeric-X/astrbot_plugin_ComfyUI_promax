@@ -288,6 +288,8 @@ class ModComfyUI(Star):
                     result_parts.append(f"{len(result.audios)}个音频")
                 if result.models_3d:
                     result_parts.append(f"{len(result.models_3d)}个3D模型")
+                if result.files:
+                    result_parts.append(f"{len(result.files)}个文件")
 
                 meta = result.metadata or {}
                 if task_type == "workflow":
@@ -314,7 +316,7 @@ class ModComfyUI(Star):
 
                 # 添加图片
                 for idx, img_info in enumerate(result.images, 1):
-                    merged_chain.append(Plain(f"\n\n第{idx}/{len(result.images) + len(result.videos) + len(result.audios) + len(result.models_3d)}张："))
+                    merged_chain.append(Plain(f"\n\n第{idx}/{len(result.images) + len(result.videos) + len(result.audios) + len(result.models_3d) + len(result.files)}张："))
                     merged_chain.append(Image.fromURL(img_info["url"]))
 
                 # 添加视频
@@ -340,17 +342,29 @@ class ModComfyUI(Star):
                     except Exception as e:
                         merged_chain.append(Plain(f"\n❌ 音频{idx}上传失败: {str(e)}"))
 
-                # 添加3D模型
+                # 添加 3D 模型
                 for idx, minfo in enumerate(result.models_3d,
                                             len(result.images) + len(result.videos) + len(result.audios) + 1):
                     merged_chain.append(Plain(f"\n\n第{idx}个3D模型：正在上传..."))
                     try:
-                        mp = await self._download_to_temp(minfo["url"], minfo["filename"])
-                        if mp:
-                            ok = await self._upload_3d_model_file(event, mp, minfo["filename"])
+                        model_path = await self._download_to_temp(minfo["url"], minfo["filename"])
+                        if model_path:
+                            ok = await self._upload_3d_model_file(event, model_path, minfo["filename"])
                             merged_chain.append(Plain(f"\n{'✅' if ok else '❌'} 3D模型{idx}上传{'成功' if ok else '失败'}"))
                     except Exception as e:
                         merged_chain.append(Plain(f"\n❌ 3D模型{idx}上传失败: {str(e)}"))
+
+                # 添加未识别的通用文件
+                for idx, finfo in enumerate(result.files,
+                                            len(result.images) + len(result.videos) + len(result.audios) + len(result.models_3d) + 1):
+                    merged_chain.append(Plain(f"\n\n第{idx}个文件：正在上传..."))
+                    try:
+                        file_path = await self._download_to_temp(finfo["url"], finfo["filename"])
+                        if file_path:
+                            ok = await self._upload_file(event, file_path, finfo["filename"])
+                            merged_chain.append(Plain(f"\n{'✅' if ok else '❌'} 文件{idx}上传{'成功' if ok else '失败'}"))
+                    except Exception as e:
+                        merged_chain.append(Plain(f"\n❌ 文件{idx}上传失败: {str(e)}"))
 
                 # 发送（优先伪造转发）
                 await self.send_fake_forward_message(event, merged_chain, len(result.images))
@@ -2297,7 +2311,7 @@ background:linear-gradient(135deg,#667eea,#764ba2);min-height:100vh}}
         except Exception:
             return False
 
-    async def _upload_3d_model_file(self, event: AstrMessageEvent, model_path: str, filename: str) -> bool:
+    async def _upload_file(self, event: AstrMessageEvent, file_path: str, filename: str) -> bool:
         try:
             from astrbot.core.platform.sources.aiocqhttp.aiocqhttp_message_event import AiocqhttpMessageEvent
             if not isinstance(event, AiocqhttpMessageEvent):
@@ -2305,12 +2319,16 @@ background:linear-gradient(135deg,#667eea,#764ba2);min-height:100vh}}
             gid = event.get_group_id()
             uid = event.get_sender_id()
             if gid:
-                await event.bot.upload_group_file(group_id=gid, file=model_path, name=filename)
+                await event.bot.upload_group_file(group_id=gid, file=file_path, name=filename)
             else:
-                await event.bot.upload_private_file(user_id=int(uid), file=model_path, name=filename)
+                await event.bot.upload_private_file(user_id=int(uid), file=file_path, name=filename)
             return True
         except Exception:
             return False
+
+    async def _upload_3d_model_file(self, event: AstrMessageEvent, model_path: str, filename: str) -> bool:
+        """以文件形式上传 3D 模型。"""
+        return await self._upload_file(event, model_path, filename)
 
     # ========== 伪造转发 ==========
 

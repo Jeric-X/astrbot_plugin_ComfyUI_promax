@@ -40,6 +40,27 @@ import aiosqlite
 
 logger = logging.getLogger("WorkflowEngine")
 
+VIDEO_EXTENSIONS = {".mp4", ".avi", ".mov", ".mkv", ".webm", ".m4v"}
+AUDIO_EXTENSIONS = {".mp3", ".wav", ".ogg", ".flac", ".m4a", ".aac"}
+IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp", ".tiff"}
+MODEL_EXTENSIONS = {".glb", ".gltf", ".obj", ".fbx", ".stl", ".ply"}
+
+
+def classify_output_file(filename: str, media_format: str = "", output_key: str = "") -> str:
+    """将 ComfyUI UI 输出归类为可发送的媒体或通用文件。"""
+    suffix = os.path.splitext(filename)[1].lower()
+    media_format = str(media_format).lower()
+    output_key = str(output_key).lower()
+    if output_key in {"audio", "audios"} or suffix in AUDIO_EXTENSIONS or media_format.startswith("audio/"):
+        return "audio"
+    if output_key in {"video", "videos"} or suffix in VIDEO_EXTENSIONS or media_format.startswith("video/"):
+        return "video"
+    if output_key in {"3d", "mesh", "model", "models"} or suffix in MODEL_EXTENSIONS:
+        return "3d"
+    if output_key in {"images", "gifs"} or suffix in IMAGE_EXTENSIONS or media_format.startswith("image/"):
+        return "image"
+    return "file"
+
 
 # ===== 统一结果对象 =====
 
@@ -51,6 +72,7 @@ class WorkflowResult:
     videos: List[Dict[str, Any]] = field(default_factory=list)
     audios: List[Dict[str, Any]] = field(default_factory=list)
     models_3d: List[Dict[str, Any]] = field(default_factory=list)
+    files: List[Dict[str, Any]] = field(default_factory=list)
     text: str = ""
     error: Optional[str] = None
     metadata: Dict[str, Any] = field(default_factory=dict)  # prompt, seed, batch_size, etc.
@@ -1008,11 +1030,17 @@ class WorkflowEngine:
             url = await self.get_image_url(server, fn, subfolder=sf, file_type=ft)
             entry = {"url": url, "filename": fn, "subfolder": sf, "type": ft}
             
-            if fn.lower().endswith('.glb'):
-                entry["url"] = f"{server.url}/view?filename={fn}&type=output&subfolder={sf}"
+            category = classify_output_file(fn, info.get("format", ""), info.get("file_type", ""))
+            if category == "image":
+                result.images.append(entry)
+            elif category == "video":
+                result.videos.append(entry)
+            elif category == "audio":
+                result.audios.append(entry)
+            elif category == "3d":
                 result.models_3d.append(entry)
             else:
-                result.images.append(entry)
+                result.files.append(entry)
             
             # 自动保存
             if self.enable_auto_save:
@@ -1082,41 +1110,46 @@ class WorkflowEngine:
             if not node_output:
                 continue
             
-            # 图片
-            if node_output.get("images"):
-                for fi in node_output["images"]:
-                    fn = fi["filename"]
-                    sf = fi.get("subfolder", "")
-                    ft = fi.get("type", "output")
-                    is_vid = (fn.lower().endswith(('.mp4', '.avi', '.mov', '.mkv', '.webm'))
-                              or node_output.get("animated", False))
-                    if is_vid:
-                        url = f"{server.url}/view?filename={fn}&type=output&subfolder={sf}"
-                        result.videos.append({"url": url, "filename": fn, "subfolder": sf, "type": ft})
+            # ComfyUI 的 UI 输出字段并不局限于 images / audio / 3d。
+            # 例如 VideoHelperSuite 会将 MP4、WebM 和 GIF 放在 gifs 中。
+            # 因此扫描所有文件列表，并依据 MIME 格式或扩展名归类。
+            seen_files = set()
+
+            for output_key, entries in node_output.items():
+                if not isinstance(entries, list):
+                    continue
+                for file_info in entries:
+                    if not isinstance(file_info, dict) or "filename" not in file_info:
+                        continue
+
+                    fn = file_info["filename"]
+                    sf = file_info.get("subfolder", "")
+                    ft = file_info.get("type", "output")
+                    identity = (ft, sf, fn)
+                    if identity in seen_files:
+                        continue
+                    seen_files.add(identity)
+
+                    url = await self.get_image_url(server, fn, subfolder=sf, file_type=ft)
+                    entry = {"url": url, "filename": fn, "subfolder": sf, "type": ft}
+
+                    category = classify_output_file(fn, file_info.get("format", ""), output_key)
+                    if category == "audio":
+                        result.audios.append(entry)
+                    elif category == "video":
+                        result.videos.append(entry)
+                    elif category == "image":
+                        result.images.append(entry)
+                    elif category == "3d":
+                        result.models_3d.append(entry)
                     else:
-                        url = await self.get_image_url(server, fn, subfolder=sf, file_type=ft)
-                        result.images.append({"url": url, "filename": fn, "subfolder": sf, "type": ft})
+                        result.files.append(entry)
+
                     if self.enable_auto_save:
                         await self.save_image_locally(
                             server, fn, f"workflow_{workflow_name}",
                             task_data.get("user_id", ""), sf, ft
                         )
-            
-            # 音频
-            if node_output.get("audio"):
-                for fi in node_output["audio"]:
-                    fn = fi["filename"]
-                    sf = fi.get("subfolder", "")
-                    url = f"{server.url}/view?filename={fn}&type=output&subfolder={sf}"
-                    result.audios.append({"url": url, "filename": fn, "subfolder": sf, "type": "output"})
-            
-            # 3D
-            if node_output.get("3d"):
-                for fi in node_output["3d"]:
-                    fn = fi["filename"]
-                    sf = fi.get("subfolder", "")
-                    url = f"{server.url}/view?filename={fn}&type=output&subfolder={sf}"
-                    result.models_3d.append({"url": url, "filename": fn, "subfolder": sf, "type": "output"})
         
         return result
 
