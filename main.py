@@ -2235,6 +2235,12 @@ background:linear-gradient(135deg,#667eea,#764ba2);min-height:100vh}}
                     await eng.server_monitor_task
                 except asyncio.CancelledError:
                     pass
+            if hasattr(eng, 'history_cleanup_task') and eng.history_cleanup_task and not eng.history_cleanup_task.done():
+                eng.history_cleanup_task.cancel()
+                try:
+                    await eng.history_cleanup_task
+                except asyncio.CancelledError:
+                    pass
             for srv in eng.comfyui_servers:
                 if srv.worker and not srv.worker.done():
                     srv.worker.cancel()

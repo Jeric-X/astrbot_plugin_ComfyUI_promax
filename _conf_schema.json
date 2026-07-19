@@ -208,6 +208,12 @@
         "default": "output",
         "hint": "图片自动保存的根目录。支持绝对路径（如'/data/images'）和相对路径（如'output'）。绝对路径直接使用，相对路径基于插件数据目录(data/plugin_data/)。目录结构：根目录/YYYY/MM/DD/"
     },
+    "history_file_retention_days": {
+        "description": "历史文件保留天数",
+        "type": "int",
+        "default": 30,
+        "hint": "自动清理自动保存目录中超过保留期的历史产物，最小值为1。按自然日计算：设为1时仅保留当天生成的文件；工作流配置和数据库不会被删除"
+    },
     "enable_output_zip": {
         "description": "启用图片打包下载功能",
         "type": "bool",

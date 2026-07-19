@@ -156,6 +156,10 @@ class WorkflowEngine:
             asyncio.create_task(self._init_database())
         except RuntimeError:
             pass
+        try:
+            self.history_cleanup_task = asyncio.create_task(self._run_history_cleanup_loop())
+        except RuntimeError:
+            pass
 
     def _init_config(self, config: dict, plugin_dir: Optional[str] = None):
         """从配置字典初始化所有配置项"""
@@ -236,6 +240,7 @@ class WorkflowEngine:
         else:
             self.auto_save_dir = str(self.data_dir / auto_save_config)
         self._ensure_directory_exists(self.auto_save_dir, "auto_save_dir")
+        self.history_file_retention_days = config.get("history_file_retention_days", 30)
         
         # 用户 workflow 目录：在 auto_save_dir 下，更新插件不会丢失
         self.user_workflow_dir = Path(self.auto_save_dir) / "workflows"
@@ -265,6 +270,7 @@ class WorkflowEngine:
         """初始化运行时状态"""
         self.task_queue: asyncio.Queue = asyncio.Queue(maxsize=self.max_task_queue)
         self.server_monitor_task: Optional[asyncio.Task] = None
+        self.history_cleanup_task: Optional[asyncio.Task] = None
         self.server_monitor_running: bool = False
         self.user_task_counts: Dict[str, int] = {}
         self.user_task_lock = asyncio.Lock()
@@ -370,7 +376,8 @@ class WorkflowEngine:
             ("default_denoise", (int, float)), ("open_time_ranges", str),
             ("task_timeout", int), ("queue_check_delay", int), ("queue_check_interval", int),
             ("empty_queue_max_retry", int), ("lora_config", list),
-            ("max_concurrent_tasks_per_user", int)
+            ("max_concurrent_tasks_per_user", int),
+            ("history_file_retention_days", int)
         ]
         for key, typ in required:
             val = getattr(self, key, None)
@@ -378,6 +385,8 @@ class WorkflowEngine:
                 raise ValueError(f"配置项错误：{key}（需为{typ.__name__}类型）")
         if self.task_timeout <= 0:
             raise ValueError("配置项错误：task_timeout 必须大于 0")
+        if self.history_file_retention_days < 1:
+            raise ValueError("配置项错误：history_file_retention_days 必须大于或等于 1")
         if not self.parsed_time_ranges:
             logger.warning(f"开放时间格式错误，使用默认时间段")
             self.open_time_ranges = "7:00-8:00,11:00-14:00,17:00-24:00"
@@ -1732,6 +1741,73 @@ class WorkflowEngine:
             except Exception as e:
                 logger.warning(f"清理临时文件失败: {e}")
         asyncio.create_task(_cleanup())
+
+    async def _run_history_cleanup_loop(self):
+        """启动时清理一次，并在每天零点后清理过期的自动保存产物。"""
+        while True:
+            try:
+                removed = await self.cleanup_expired_history_files()
+                if removed:
+                    logger.info(f"历史文件清理完成：已删除 {removed} 个过期日期目录")
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                logger.error(f"清理历史文件时出错: {e}")
+
+            now = datetime.now()
+            next_run = (now + timedelta(days=1)).replace(
+                hour=0, minute=5, second=0, microsecond=0
+            )
+            await asyncio.sleep((next_run - now).total_seconds())
+
+    async def cleanup_expired_history_files(self) -> int:
+        """删除自动保存目录中超过保留期的日期目录，返回删除数量。
+
+        保留期按自然日计算，并且包含当天；例如保留 1 天时，昨天及更早的
+        ``YYYY/MM/DD`` 目录会被删除。只处理日期格式的叶目录，因此不会影响
+        workflow 配置、数据库或自动保存目录中的其他文件。
+        """
+        cutoff = datetime.now().date() - timedelta(
+            days=self.history_file_retention_days - 1
+        )
+        root = Path(self.auto_save_dir).resolve()
+
+        def _cleanup() -> int:
+            if not root.is_dir():
+                return 0
+
+            expired_dirs: List[Path] = []
+            for candidate in root.rglob("*"):
+                if not candidate.is_dir() or candidate.is_symlink():
+                    continue
+                parts = candidate.relative_to(root).parts
+                if len(parts) < 3 or parts[0] == "workflows":
+                    continue
+                year, month, day = parts[-3:]
+                if not (len(year) == 4 and year.isdigit()
+                        and len(month) == 2 and month.isdigit()
+                        and len(day) == 2 and day.isdigit()):
+                    continue
+                try:
+                    directory_date = datetime(
+                        int(year), int(month), int(day)
+                    ).date()
+                except ValueError:
+                    continue
+                if directory_date < cutoff:
+                    expired_dirs.append(candidate)
+
+            deleted = 0
+            for directory in expired_dirs:
+                # 防御性检查：即使目录结构被外部改动，也只删除保存根目录内的目录。
+                if os.path.commonpath((str(root), str(directory.resolve()))) != str(root):
+                    logger.warning(f"跳过保存目录外的历史路径: {directory}")
+                    continue
+                shutil.rmtree(directory)
+                deleted += 1
+            return deleted
+
+        return await asyncio.get_running_loop().run_in_executor(None, _cleanup)
 
     async def get_today_images(self, user_id: Optional[str] = None) -> List[str]:
         """获取今日生成的图片文件列表"""
