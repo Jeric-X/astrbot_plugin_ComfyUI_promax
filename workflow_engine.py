@@ -128,15 +128,17 @@ class WorkflowEngine:
 
     # ==================== 初始化 & 单例 ====================
 
-    def __init__(self, config: dict, plugin_dir: Optional[str] = None):
+    def __init__(self, config: dict, plugin_dir: Optional[str] = None,
+                 data_dir: Optional[Union[str, Path]] = None):
         """
         初始化引擎实例（不应直接调用，请使用 get_instance）
         
         Args:
             config: 配置字典（来自 AstrBot 注入或从 JSON 文件读取）
             plugin_dir: 插件目录路径（用于找 workflow 等子目录）
+            data_dir: 持久化数据目录；AstrBot 运行时应传入 StarTools.get_data_dir()
         """
-        self._init_config(config, plugin_dir)
+        self._init_config(config, plugin_dir, data_dir)
         self._init_state()
         
         # workflows 加载完成事件（供适配层等待）
@@ -161,16 +163,18 @@ class WorkflowEngine:
         except RuntimeError:
             pass
 
-    def _init_config(self, config: dict, plugin_dir: Optional[str] = None):
+    def _init_config(self, config: dict, plugin_dir: Optional[str] = None,
+                     data_dir: Optional[Union[str, Path]] = None):
         """从配置字典初始化所有配置项"""
         # 插件目录
         self.plugin_dir = plugin_dir or str(Path(__file__).parent)
         self.workflow_dir = Path(self.plugin_dir) / "workflow"
         self.config_dir = Path(self.plugin_dir)
         
-        # 数据目录（引擎不依赖 AstrBot API，用插件目录下的 data）
-        self.data_dir = Path(self.plugin_dir) / "data"
+        # 数据目录由宿主注入。未注入时保留独立运行/测试的旧路径兼容性。
+        self.data_dir = Path(data_dir) if data_dir else Path(self.plugin_dir) / "data"
         self.data_dir.mkdir(exist_ok=True)
+        self.legacy_data_dir = Path(self.plugin_dir) / "data"
         
         # 用户 workflow 目录（在 auto_save_dir 下，更新插件不会丢失）
         self.user_workflow_dir: Optional[Path] = None
@@ -239,6 +243,10 @@ class WorkflowEngine:
             self.auto_save_dir = auto_save_config
         else:
             self.auto_save_dir = str(self.data_dir / auto_save_config)
+            self._migrate_legacy_auto_save_dir(
+                self.legacy_data_dir / auto_save_config,
+                Path(self.auto_save_dir),
+            )
         self._ensure_directory_exists(self.auto_save_dir, "auto_save_dir")
         self.history_file_retention_days = config.get("history_file_retention_days", 30)
         
@@ -281,7 +289,8 @@ class WorkflowEngine:
 
     @classmethod
     async def get_instance(cls, config: Optional[dict] = None,
-                           plugin_dir: Optional[str] = None) -> 'WorkflowEngine':
+                           plugin_dir: Optional[str] = None,
+                           data_dir: Optional[Union[str, Path]] = None) -> 'WorkflowEngine':
         """
         获取引擎单例实例
         
@@ -294,7 +303,9 @@ class WorkflowEngine:
                 if cls._instance is None:
                     if config is None:
                         raise RuntimeError("首次初始化必须提供 config")
-                    cls._instance = cls(config=config, plugin_dir=plugin_dir)
+                    cls._instance = cls(
+                        config=config, plugin_dir=plugin_dir, data_dir=data_dir
+                    )
         return cls._instance
 
     @classmethod
@@ -427,6 +438,33 @@ class WorkflowEngine:
                 os.makedirs(dp, exist_ok=True)
         else:
             os.makedirs(dp, exist_ok=True)
+
+    def _migrate_legacy_auto_save_dir(self, legacy_dir: Path, target_dir: Path) -> None:
+        """迁移旧插件目录中的持久化数据到 AstrBot 插件数据目录。
+
+        只在目标目录为空时执行，以免覆盖新目录中的数据。迁移整个自动保存目录，
+        因而会一并保留用户工作流、历史产物和 user.db。
+        """
+        try:
+            legacy_dir = legacy_dir.resolve()
+            target_dir = target_dir.resolve()
+            if legacy_dir == target_dir or not legacy_dir.is_dir():
+                return
+
+            if target_dir.exists() and any(target_dir.iterdir()):
+                logger.info(
+                    "新数据目录已有内容，跳过旧数据迁移：%s -> %s",
+                    legacy_dir, target_dir,
+                )
+                return
+
+            target_dir.parent.mkdir(parents=True, exist_ok=True)
+            if target_dir.exists():
+                target_dir.rmdir()
+            shutil.move(str(legacy_dir), str(target_dir))
+            logger.info("已迁移插件历史数据：%s -> %s", legacy_dir, target_dir)
+        except Exception as e:
+            logger.warning("迁移旧插件历史数据失败，保留原目录不变: %s", e)
 
     def _filter_server_urls(self, text: str) -> str:
         if not text or not self.comfyui_servers:

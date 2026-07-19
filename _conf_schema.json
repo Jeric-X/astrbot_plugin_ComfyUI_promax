@@ -203,10 +203,10 @@
         "hint": "控制是否自动保存每天生成的图片到本地目录，true=保存，false=不保存"
     },
     "auto_save_directory": {
-        "description": "自动保存目录",
+        "description": "插件数据存储根目录",
         "type": "string",
         "default": "output",
-        "hint": "图片自动保存的根目录。支持绝对路径（如'/data/images'）和相对路径（如'output'）。绝对路径直接使用，相对路径基于插件数据目录(data/plugin_data/)。目录结构：根目录/YYYY/MM/DD/"
+        "hint": "持久化存储根目录，包含：生成产物（YYYY/MM/DD/）、用户自定义工作流（workflows/）和其他用户数据。支持绝对路径（如'/data/comfyui'）和相对路径（如'output'）；绝对路径直接使用，相对路径基于 AstrBot 的插件数据目录(data/plugin_data/插件名/)。修改此项不会自动迁移旧目录中的数据。"
     },
     "history_file_retention_days": {
         "description": "历史文件保留天数",

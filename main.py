@@ -126,9 +126,13 @@ class ModComfyUI(Star):
         super().__init__(context)
         self.config = config
         self.plugin_dir = str(Path(__file__).parent)
+        self.data_dir = StarTools.get_data_dir()
+        self.data_dir.mkdir(exist_ok=True)
 
         # 1. 创建引擎（构造函数是同步的，内部用 create_task 启动异步组件）
-        self.engine = WorkflowEngine(config=config, plugin_dir=self.plugin_dir)
+        self.engine = WorkflowEngine(
+            config=config, plugin_dir=self.plugin_dir, data_dir=self.data_dir
+        )
 
         # 2. 适配层专有配置
         self.group_whitelist = [str(g) for g in config.get("group_whitelist", [])]
@@ -148,8 +152,6 @@ class ModComfyUI(Star):
         self.help_server_runner: Optional[web.AppRunner] = None
         self.help_server_site: Optional[web.TCPSite] = None
         self.actual_help_port = self.help_server_port
-        self.data_dir = StarTools.get_data_dir()
-        self.data_dir.mkdir(exist_ok=True)
 
         # 4. 设置模块级引擎引用（供 WorkflowFilter 直接读取 workflow_prefixes）
         global _workflow_engine_ref
